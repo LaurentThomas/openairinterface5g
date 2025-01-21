@@ -47,6 +47,11 @@ if(OAI_VRTSIM)
   add_subdirectory(vrtsim)
 endif()
 
+add_boolean_option(OAI_OC OFF "Activate OAI's USRP driver" OFF)
+if(OAI_OC)
+  add_subdirectory(oc)
+endif()
+
 add_boolean_option(OAI_RF_EMULATOR ON "Activate OAI's RF emulator" OFF)
 if(OAI_RF_EMULATOR)
   add_subdirectory(emulator)

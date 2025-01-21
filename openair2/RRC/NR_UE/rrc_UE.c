@@ -406,6 +406,7 @@ static void nr_rrc_configure_default_SI(NR_UE_RRC_SI_INFO *SI_info,
       NR_SchedulingInfo_t *schedulingInfo = si_SchedulingInfo->schedulingInfoList.list.array[i];
       for (int j = 0; j < schedulingInfo->sib_MappingInfo.list.count; j++) {
         NR_SIB_TypeInfo_t *sib_Type = schedulingInfo->sib_MappingInfo.list.array[j];
+	LOG_W(PHY,"SIB1 tells us we have SIB%ld\n", sib_Type->type+2);
         SI_info->default_otherSI_map[i] |= 1 << sib_Type->type;
       }
     }

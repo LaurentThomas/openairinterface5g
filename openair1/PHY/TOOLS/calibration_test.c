@@ -9,7 +9,7 @@
 #include <openair1/PHY/TOOLS/calibration_scope.h>
 #include "nfapi/oai_integration/vendor_ext.h"
 #include "common/config/config_userapi.h"
-
+#include <arpa/inet.h>
 
 int oai_exit=false;
 unsigned int mmapped_dma=0;
@@ -24,8 +24,111 @@ THREAD_STRUCT thread_struct;
 int read_recplayconfig(recplay_conf_t **recplay_conf, recplay_state_t **recplay_state) {return 0;}
 void nfapi_setmode(nfapi_mode_t nfapi_mode) {}
 void set_taus_seed(unsigned int seed_init){};
+
+// configmodule_interface_t *uniqCfg = NULL;
+const int tx_ahead = DFT * 50;
+openair0_timestamp_t rx_timestamp = 0;
+openair0_timestamp_t tx_timestamp = 0;
+
+void *write_thread(void *arg)
+{
+  threads_t params = *(threads_t *)arg;
+  c16_t **samplesTx = params.samplesTx;
+  uint64_t ts = 0;
+  for (int i = 0; i < params.dft_sz; i++) {
+    // Better to select a frequency having an integer division with the sampling rate to avoid having DFT leakage later on
+    //  .r = cos and .i = sin -> having a positive spectrum
+    //  For negative spectrum -> .r = sin and .i = cos
+    samplesTx[0][i].r = 16000 * cos((ts * M_PI * 2 * 30720) / 122880);
+    samplesTx[0][i].i = 16000 * sin((ts * M_PI * 2 * 30720) / 122880); // samplesTx[0][i].r;
+    // Hamming Window - to allow some pseudo-continuity between batches as this is not a continuously generated signal as in real
+    // life
+    samplesTx[0][i].r = (samplesTx[0][i].r) * (0.54 - 0.46 * cos(2 * M_PI * 30720 / 122880));
+    samplesTx[0][i].i = (samplesTx[0][i].i) * (0.54 - 0.46 * cos(2 * M_PI * 30720 / 122880));
+    ts++;
+  }
+  double avg = 0;
+  for (int i = 0; i < params.dft_sz; i++) {
+    avg += sqrt(squaredMod(samplesTx[0][i]));
+  }
+  printf("avg: %f \n", avg / params.dft_sz);
+  uint64_t count = 0;
+  struct timespec last_second;
+  clock_gettime(CLOCK_REALTIME, &last_second);
+
+  openair0_timestamp_t last_tx_timestamp = 0, new_tx = 0;
+
+  while (!oai_exit) {
+    /*
+    do {
+      pthread_mutex_lock(&params.txMutex);
+      printf("write got lock\n");
+      new_tx = tx_timestamp & ~31;
+      pthread_mutex_unlock(&params.txMutex);
+      if (new_tx == last_tx_timestamp)
+        usleep(5);
+    } while (last_tx_timestamp == new_tx);
+    */
+    last_tx_timestamp = new_tx & ~31;
+    params.rfdevice->trx_write_func(params.rfdevice, new_tx + tx_ahead, (void **)samplesTx, params.dft_sz, params.antennas, 0);
+    count++;
+    struct timespec now;
+    clock_gettime(CLOCK_REALTIME, &now);
+    if (now.tv_sec != last_second.tv_sec) {
+      printf("write thread wrote %lu times in one second\n", count);
+      last_second = now;
+      count = 0;
+    }
+  }
+  return NULL;
+}
+
+void *read_thread(void *arg)
+{
+  threads_t params = *(threads_t *)arg;
+  c16_t **samplesRx = params.samplesRx;
+  uint64_t count = 0;
+  struct timespec last_second;
+  clock_gettime(CLOCK_REALTIME, &last_second);
+  while (!oai_exit) {
+    pthread_mutex_lock(&params.rxMutex);
+    int ret = params.rfdevice->trx_read_func(params.rfdevice, &rx_timestamp, (void **)samplesRx, params.dft_sz, params.antennas);
+    pthread_mutex_unlock(&params.rxMutex);
+    if (ret != params.dft_sz)
+      printf("read of :%d\n", ret);
+    count++;
+    pthread_mutex_lock(&params.txMutex);
+    tx_timestamp = rx_timestamp;
+    pthread_mutex_unlock(&params.txMutex);
+    struct timespec now;
+    clock_gettime(CLOCK_REALTIME, &now);
+    if (now.tv_sec != last_second.tv_sec) {
+      printf("read thread got %lu blocks in one second, samples per block: %d, nb samples: %lu\n", count, ret, count*ret);
+      count=0;
+      last_second.tv_sec++;
+      #if 0
+      FILE *fd = fopen("trace.iq", "w+");
+      if (!fd)
+        abort();
+
+      /* We should advance +1 only if header was detected in previous steps
+       * Which will make the read working even without timestamped rxdata
+       */
+      c16_t *s = samplesRx[0]; /* Exclude the header from the samples */
+      for (int i = 0; i < ret; i++) {
+        /* We need to throw the entie 256-bits word if we detect the 64-bits header.
+         * This may happens when receiving a big packet size in chuncks.
+         */
+        fprintf(fd, "%d %d %d\n", i, s[i].r, s[i].i);
+      }
+      #endif
+    }
+  }
+  return NULL;
+}
+
 int main(int argc, char **argv) {
-  ///static configuration for NR at the moment
+  /// static configuration for NR at the moment
   if ((uniqCfg = load_configmodule(argc, argv, CONFIG_ENABLECMDLINEONLY)) == NULL) {
     exit_fun("[SOFTMODEM] Error, configuration module init failed\n");
   }
@@ -34,20 +137,12 @@ int main(int argc, char **argv) {
   setvbuf(stderr, NULL, _IONBF, 0);
   logInit();
 
+  paramdef_t cmdline_params[] = CMDLINE_PARAMS_DESC_GNB;
+
   CONFIG_SETRTFLAG(CONFIG_NOEXITONHELP);
   get_common_options(uniqCfg);
   CONFIG_CLEARRTFLAG(CONFIG_NOEXITONHELP);
   lock_memory_to_ram();
-    
-  int sampling_rate=30.72e6;
-  int DFT=2048;
-  int TxAdvanceInDFTSize=12;
-  int antennas=1;
-  uint64_t freq=3619.200e6;
-  int rxGain=90;
-  int txGain=90;
-  int filterBand=40e6;
-  char * usrp_addrs="type=b200";
 
   int h=open("/dev/cpu_dma_latency", 0666);
   int lat=2; // micro second
@@ -62,213 +157,62 @@ int main(int argc, char **argv) {
   int filterBand = 40e6;
 
   openair0_config_t openair0_cfg = {
-      .duplex_mode = 0,
-      .sample_rate = sampling_rate,
-      .tx_sample_advance = 0,
-      .rx_num_channels = antennas,
-      .tx_num_channels = antennas,
-      .rx_freq = {freq, freq, freq, freq},
-      .tx_freq = {freq, freq, freq, freq},
-      .rx_gain_calib_table = NULL,
-      .rx_gain = {rxGain, rxGain, rxGain, rxGain},
-      .tx_gain = {txGain, txGain, txGain, txGain},
-      .rx_bw = filterBand,
-      .tx_bw = filterBand,
-      .clock_source = internal, // internal gpsdo external
-      .time_source = internal, // internal gpsdo external
-      .autocal = {0},
-      //! rf devices work with x bits iqs when oai have its own iq format
-      //! the two following parameters are used to convert iqs
-      .configFilename = "",
-      .recplay_mode = 0,
-      .recplay_conf = NULL,
+    .duplex_mode = 0,
+    .sample_rate = sampling_rate,
+    .tx_sample_advance = 0,
+    .rx_num_channels = antennas,
+    .tx_num_channels = antennas,
+    .rx_freq = {freq, freq, freq, freq},
+    .tx_freq = {freq, freq, freq, freq},
+    .rx_gain_calib_table = NULL,
+    .rx_gain = {rxGain, rxGain, rxGain, rxGain},
+    .tx_gain = {txGain, txGain, txGain, txGain},
+    .rx_bw = filterBand,
+    .tx_bw = filterBand,
+    .clock_source = internal, // internal gpsdo external
+    .time_source = internal, // internal gpsdo external
+    .autocal = {0},
+    //! rf devices work with x bits iqs when oai have its own iq format
+    //! the two following parameters are used to convert iqs
+    .configFilename = "",
+    .recplay_mode = 0,
+    .recplay_conf = NULL,
   };
   //-----------------------
-  openair0_device_t rfdevice= {
-    /*!brief Type of this device */
-    .type=NONE_DEV,
-    /*!brief Transport protocol type that the device supports (in case I/Q samples need to be transported) */
-    .transp_type=NONE_TP,
-    /*!brief Type of the device's host (RAU/RRU) */
-    .host_type=MIN_HOST_TYPE,
-    /* !brief RF frontend parameters set by application */
-    .openair0_cfg=NULL, //set by device_init
-    //! record player data, definition in record_player.h
-    .recplay_state=NULL,
-    /*!brief Can be used by driver to hold internal structure*/
-    .priv=NULL,
-    /* Functions API, which are called by the application*/
-    /*! \brief Called to start the transceiver. Return 0 if OK, < 0 if error
-        @param device pointer to the device structure specific to the RF hardware target
-    */
-    .trx_start_func=NULL,
-
-    /*! \brief Called to configure the device
-         @param device pointer to the device structure specific to the RF hardware target
-     */
-    .trx_config_func=NULL,
-
-    /*! \brief Called to send a request message between RAU-RRU on control port
-        @param device pointer to the device structure specific to the RF hardware target
-        @param msg pointer to the message structure passed between RAU-RRU
-        @param msg_len length of the message
-    */
-    .trx_ctlsend_func=NULL,
-
-    /*! \brief Called to receive a reply  message between RAU-RRU on control port
-        @param device pointer to the device structure specific to the RF hardware target
-        @param msg pointer to the message structure passed between RAU-RRU
-        @param msg_len length of the message
-    */
-    .trx_ctlrecv_func=NULL,
-
-    /*! \brief Called to send samples to the RF target
-          @param device pointer to the device structure specific to the RF hardware target
-        @param timestamp The timestamp at whicch the first sample MUST be sent
-        @param buff Buffer which holds the samples (2 dimensional)
-        @param nsamps number of samples to be sent
-        @param number of antennas
-        @param flags flags must be set to TRUE if timestamp parameter needs to be applied
-    */
-    .trx_write_func=NULL,
-
-    /*! \brief Called to send samples to the RF target
-        @param device pointer to the device structure specific to the RF hardware target
-        @param timestamp The timestamp at whicch the first sample MUST be sent
-        @param buff Buffer which holds the samples (1 dimensional)
-        @param nsamps number of samples to be sent
-        @param antenna_id index of the antenna if the device has multiple anteannas
-        @param flags flags must be set to TRUE if timestamp parameter needs to be applied
-    */
-    .trx_write_func2=NULL,
-
-    /*! \brief Receive samples from hardware.
-     * Read \ref nsamps samples from each channel to buffers. buff[0] is the array for
-     * the first channel. *ptimestamp is the time at which the first sample
-     * was received.
-     * \param device the hardware to use
-     * \param[out] ptimestamp the time at which the first sample was received.
-     * \param[out] buff An array of pointers to buffers for received samples. The buffers must be large enough to hold the number of samples \ref nsamps.
-     * \param nsamps Number of samples. One sample is 2 byte I + 2 byte Q => 4 byte.
-     * \param num_antennas number of antennas from which to receive samples
-     * \returns the number of sample read
-     */
-
-    .trx_read_func=NULL,
-
-    /*! \brief Receive samples from hardware, this version provides a single antenna at a time and returns.
-     * Read \ref nsamps samples from each channel to buffers. buff[0] is the array for
-     * the first channel. *ptimestamp is the time at which the first sample
-     * was received.
-     * \param device the hardware to use
-     * \param[out] ptimestamp the time at which the first sample was received.
-     * \param[out] buff A pointers to a buffer for received samples. The buffer must be large enough to hold the number of samples \ref nsamps.
-     * \param nsamps Number of samples. One sample is 2 byte I + 2 byte Q => 4 byte.
-     * \param antenna_id Index of antenna from which samples were received
-     * \returns the number of sample read
-     */
-    .trx_read_func2=NULL,
-
-    /*! \brief print the device statistics
-     * \param device the hardware to use
-     * \returns  0 on success
-     */
-    /*! \brief print the device statistics
-       * \param device the hardware to use
-       * \returns  0 on success
-       */
-    .trx_get_stats_func=NULL,
-
-    /*! \brief Reset device statistics
-     * \param device the hardware to use
-     * \returns 0 in success
-     */
-    .trx_reset_stats_func=NULL,
-
-    /*! \brief Terminate operation of the transceiver -- free all associated resources
-     * \param device the hardware to use
-     */
-    .trx_end_func=NULL,
-
-    /*! \brief Stop operation of the transceiver
-     */
-    .trx_stop_func=NULL,
-
-    /* Functions API related to UE*/
-
-    /*! \brief Set RX feaquencies
-     * \param device the hardware to use
-     * \param openair0_cfg RF frontend parameters set by application
-     * \returns 0 in success
-     */
-    .trx_set_freq_func=NULL,
-
-    /*! \brief Set gains
-     * \param device the hardware to use
-     * \param openair0_cfg RF frontend parameters set by application
-     * \returns 0 in success
-     */
-    .trx_set_gains_func=NULL,
-
-    /*! \brief RRU Configuration callback
-     * \param idx RU index
-     * \param arg pointer to capabilities or configuration
-     */
-    .configure_rru=NULL,
-    /*! \brief Pointer to generic RRU private information
-       */
-    .thirdparty_priv=NULL,
-    .thirdparty_init=NULL,
-    /*! \brief Callback for Third-party RRU Cleanup routine
-       \param device the hardware configuration to use
-     */
-    .thirdparty_cleanup=NULL,
-
-    /*! \brief Callback for Third-party start streaming routine
-       \param device the hardware configuration to use
-     */
-    .thirdparty_startstreaming=NULL,
-
-    /*! \brief RRU Configuration callback
-     * \param idx RU index
-     * \param arg pointer to capabilities or configuration
-     */
-    .trx_write_init=NULL,
-    /* \brief Get internal parameter
-     * \param id parameter to get
-     * \return a pointer to the parameter
-     */
-    .get_internal_parameter=NULL,
+  
+  openair0_device_t rfdevice = {
+    .type = NONE_DEV,
+    .transp_type = NONE_TP,
+    .host_type = MIN_HOST_TYPE,
   };
   
-  openair0_device_load(&rfdevice,&openair0_cfg);
+  openair0_device_load(&rfdevice, &openair0_cfg);
 
-  void ** samplesRx = (void **)malloc16(antennas* sizeof(c16_t *) );
-  void ** samplesTx = (void **)malloc16(antennas* sizeof(c16_t *) );
+  printf("generate a sinus wave at middle RB");
+  load_dftslib();
 
-  int fd=open(getenv("rftestInputFile"),O_RDONLY);
-  AssertFatal(fd>=0,"%s",strerror(errno));
-  
-  for (int i=0; i<antennas; i++) {
-    samplesRx[i] = (int32_t *)malloc16_clear( DFT*sizeof(c16_t) );
-    samplesTx[i] = (int32_t *)malloc16_clear( DFT*sizeof(c16_t) );
+  c16_t **samplesRx = malloc16(antennas * sizeof(c16_t *));
+  for (int i = 0; i < antennas; i++) {
+    samplesRx[i] = malloc16_clear(DFT * sizeof(c16_t));
+  }
+  c16_t **samplesTx = malloc16(antennas * sizeof(c16_t *));
+  for (int i = 0; i < antennas; i++) {
+    samplesTx[i] = malloc16_clear(DFT * sizeof(c16_t));
   }
 
-  CalibrationInitScope(samplesRx, &rfdevice);
-  openair0_timestamp_t timestamp=0;
+  /* scopedata shall be filled from a software FIFO and not directly from the samples */
+  threads_t params = (threads_t){&rfdevice, antennas, DFT, samplesRx, samplesTx};
+  pthread_mutex_init(&params.rxMutex, NULL);
+  pthread_mutex_init(&params.txMutex, NULL);
+  CalibrationInitScope(&params);
   rfdevice.trx_start_func(&rfdevice);
-  
-  while(!oai_exit) {
-    for (int i=0; i<antennas; i++) {
-      ssize_t len = read(fd, samplesTx[i], DFT*sizeof(c16_t));
-      if (len < 0) {
-        fprintf(stderr, "error during read(): errno %d, %s\n", errno, strerror(errno));
-        exit(1);
-      }
-    }
-    rfdevice.trx_read_func(&rfdevice, &timestamp, samplesRx, DFT, antennas);
-    rfdevice.trx_write_func(&rfdevice, timestamp + TxAdvanceInDFTSize * DFT, samplesTx, DFT, antennas, 0);
-  }
+
+  pthread_t w_thread={};
+  // threadCreate(&w_thread, write_thread, &params, "write_thr", -1, OAI_PRIORITY_RT);
+  pthread_t r_thread;
+  threadCreate(&r_thread, read_thread, &params, "read_thr", 2, OAI_PRIORITY_RT);
+  (void)pthread_join(w_thread, NULL);
+  (void)pthread_join(r_thread, NULL);
 
   return 0;
 }

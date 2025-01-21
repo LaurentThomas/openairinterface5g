@@ -147,7 +147,14 @@ void *L1_tx_thread(void *arg) {
   PHY_VARS_gNB *gNB = (PHY_VARS_gNB*)arg;
 
   while (oai_exit == 0) {
-     notifiedFIFO_elt_t *res = pullNotifiedFIFO(&gNB->L1_tx_out);
+    notifiedFIFO_elt_t *res = NULL;
+    do {
+      res = pollNotifiedFIFO(&gNB->L1_tx_out);
+      if (!res) {
+        LOG_W(HW, "possible underrun\n");
+        usleep(300);
+      }
+    } while (!res);
      if (res == NULL) // stopping condition, happens only when queue is freed
        break;
      processingData_L1tx_t *info = (processingData_L1tx_t *)NotifiedFifoData(res);
