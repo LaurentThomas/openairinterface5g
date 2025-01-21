@@ -230,8 +230,8 @@ function main() {
             shift 2;;
        -w | --hardware)
             case "$2" in
-                "USRP" | "BLADERF" | "LMSSDR" | "IRIS" | "ZMQ")
-                    HWs+=" OAI_"$2
+                "USRP" | "BLADERF" | "LMSSDR" | "IRIS" | "ZMQ" | "OC")
+                    HWs+=" OAI_$2"
                     TARGET_LIST="$TARGET_LIST oai_${2,,}devif" # ,, makes lowercase
                     CMAKE_CMD="$CMAKE_CMD -DOAI_$2=ON"
                     ;;

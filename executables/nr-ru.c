@@ -165,7 +165,7 @@ static void rx_rf(RU_t *ru, int *frame, int *slot)
     uint32_t samples_per_slot_prev = get_samples_per_slot((*slot - 1) % fp->slots_per_frame, fp);
 
     if (proc->timestamp_rx - old_ts != samples_per_slot_prev) {
-      LOG_D(PHY,
+      LOG_W(PHY,
             "rx_rf: rfdevice timing drift of %" PRId64 " samples (ts_off %" PRId64 ")\n",
             proc->timestamp_rx - old_ts - samples_per_slot_prev,
             ru->ts_offset);
