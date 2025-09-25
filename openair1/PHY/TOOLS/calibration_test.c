@@ -49,36 +49,39 @@ int main(int argc, char **argv) {
   int filterBand=40e6;
   char * usrp_addrs="type=b200";
 
-  openair0_config_t openair0_cfg= {
-    //! the sample rate for both transmit and receive.
-    .sample_rate=sampling_rate,
-    //! samples per packet on the fronthaul interface
-    .samples_per_packet=1024,
-    //! number of RX channels (=RX antennas)
-    .rx_num_channels=antennas,
-    //! number of TX channels (=TX antennas)
-    .tx_num_channels=antennas,
-    //! \brief Center frequency in Hz for RX.
-    //! index: [0..rx_num_channels[
-    .rx_freq={freq,freq,freq,freq},
-    //! \brief Center frequency in Hz for TX.
-    //! index: [0..rx_num_channels[ !!! see lte-ue.c:427 FIXME iterates over rx_num_channels
-    .tx_freq={freq,freq,freq,freq},
-    //! \brief Gain for RX in dB.
-    //! index: [0..rx_num_channels]
-    .rx_gain={rxGain,rxGain,rxGain,rxGain},
-    //! gain for TX in dB
-    .tx_gain={txGain,txGain,txGain,txGain},
-    //! RX bandwidth in Hz
-    .rx_bw=filterBand,
-    //! TX bandwidth in Hz
-    .tx_bw=filterBand,
-    //! clock source
-    .clock_source=external,//internal gpsdo external
-    //! timing_source
-    .time_source=internal, //internal gpsdo external
-    //! Manual SDR IP address
-    .sdr_addrs=usrp_addrs,
+  int h=open("/dev/cpu_dma_latency", 0666);
+  int lat=2; // micro second
+  assert(sizeof(lat)==write(h,&lat,sizeof(lat)));
+
+  int sampling_rate = 30.72e6;
+
+  int antennas = 1;
+  uint64_t freq = 2420.0e6;
+  int rxGain = 90;
+  int txGain = 0;
+  int filterBand = 40e6;
+
+  openair0_config_t openair0_cfg = {
+      .duplex_mode = 0,
+      .sample_rate = sampling_rate,
+      .tx_sample_advance = 0,
+      .rx_num_channels = antennas,
+      .tx_num_channels = antennas,
+      .rx_freq = {freq, freq, freq, freq},
+      .tx_freq = {freq, freq, freq, freq},
+      .rx_gain_calib_table = NULL,
+      .rx_gain = {rxGain, rxGain, rxGain, rxGain},
+      .tx_gain = {txGain, txGain, txGain, txGain},
+      .rx_bw = filterBand,
+      .tx_bw = filterBand,
+      .clock_source = internal, // internal gpsdo external
+      .time_source = internal, // internal gpsdo external
+      .autocal = {0},
+      //! rf devices work with x bits iqs when oai have its own iq format
+      //! the two following parameters are used to convert iqs
+      .configFilename = "",
+      .recplay_mode = 0,
+      .recplay_conf = NULL,
   };
   //-----------------------
   openair0_device_t rfdevice= {
