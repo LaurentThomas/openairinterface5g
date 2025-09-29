@@ -26,17 +26,30 @@
 
 #define DEVICE_WRITE_DEFAULT "/dev/xdma0_h2c_0"
 #define DEVICE_READ_DEFAULT "/dev/xdma0_c2h_0"
-#define OC_BUFFER 8192 * 16 // in bytes
-#define SAMPLE_BUF (OC_BUFFER / sizeof(c16_t)) // in samples
+#define WRITE_BLOCK_NB_SAMPLES 2048
 #define NB_BLOCKS_PER_READ 16
 #define READ_BLOCK_NB_SAMPLES 2048
 #define PKT_HEADER_NB_SAMPLES 7
 #define PKT_FOOTER_NB_SAMPLES 1
 #define PKT_OVERHEAD_NB_SAMPLES (PKT_HEADER_NB_SAMPLES + PKT_FOOTER_NB_SAMPLES)
-static const uint64_t magic = 0xA5A5A5A5A5A5A5A5;
+static const uint64_t magic_tx = 0xA5A50be3A5A5A5A5LL;
 static const uint64_t magic_rx = 0xA5A50be3A5A5A5A5LL;
 static const uint32_t magic_footer1 = 0xce11;
 static const uint32_t magic_footer2 = 0x5A;
+
+typedef struct {
+  uint64_t control;
+  uint32_t packetSeqNum: 16;
+  uint32_t packetSz: 16;
+  uint32_t seqId: 2;
+  uint32_t filler: 6;
+  uint32_t markers: 8;
+  uint32_t filler2: 16;
+  uint32_t txGain: 24;
+  uint32_t filler3: 8;
+  uint32_t ppsOffset;
+  uint64_t timestamp;
+} __attribute__((packed)) headerTx_t;
 
 typedef struct {
   uint64_t control;
@@ -52,12 +65,11 @@ typedef struct {
   uint8_t filler   : 1;
   uint8_t InbandReadAddr;
   uint16_t InbandReadValue;
-
   uint32_t ppsOffset: 30;
   uint32_t ppsAlive: 1;
   uint32_t gpsLock: 1;
   uint64_t timestamp;
-} __attribute__((packed)) header_t;
+} __attribute__((packed)) headerRx_t;
 
 typedef struct {
   uint16_t control1;
@@ -68,12 +80,12 @@ typedef struct {
 } __attribute__((packed)) footer_t;
 
 typedef struct {
-  header_t h;
+  headerRx_t h;
   uint32_t b[READ_BLOCK_NB_SAMPLES];
   footer_t f;
 } __attribute__((packed)) packet_t;
 
-static inline void dumpHD(std::string ctx, header_t h)
+static inline void dumpHD(std::string ctx, headerRx_t h)
 {
   printf("header dump, %s\n", ctx.c_str());
   uint8_t *z = (uint8_t *)&h;
@@ -152,9 +164,9 @@ void *write_thread(void *arg)
 void *read_thread(void *arg)
 {
   // threads_t params = *(threads_t *)arg;
-
   return NULL;
 }
+
 #if 0
 //TEST 4G 20MHz
 int nsamps2 = (nsamps*4) / 8 ;
@@ -196,45 +208,42 @@ static int32_t signalEnergy(int32_t *input, uint32_t length)
 }
 
 // DC-filter: 0 will be done in FPGA after seeing 128-consecutive samples having the same value
-static inline void write_block(oc_state_t *s)
+static inline int write_block(oc_state_t *s, c16_t *samples, uint sz)
 {
-  // uint64_t st = rdtsc_oai();
-  uint8_t buf[SAMPLE_BUF * sizeof(c16_t) + sizeof(header_t)];
-  *(header_t *)buf = (header_t){
-    .control = magic,
-    /*
-      .sdrStatus = 0,
-      .timestamp = s->tx_ts,
-      .trailer = SAMPLE_BUF,
-    */
-  };
-  memcpy(buf + sizeof(header_t), s->tx_block[0], SAMPLE_BUF * sizeof(c16_t));
-  size_t wrote = write(s->fd_write, buf, sizeof(buf));
-  // uint64_t end = rdtsc_oai();
-  //  if (end-st > 100*5000)
-  //  LOG_E(HW,"one write to xdma took %ld µs, ts:%lu\n", (end-st)/5000, s->tx_ts);
-  /*
-    static uint64_t  old;
-    if (old-st > 5000*500)
-    LOG_E(HW,"we come back to writer after: %ld µs\n", (old-st)/5000);
-    old=st;
-  */
-  wrote = (wrote - sizeof(header_t)) / sizeof(c16_t);
-  if (wrote != SAMPLE_BUF)
-    LOG_E(HW, "write to SDR failed, request: %lu, wrote %ld\n", SAMPLE_BUF, wrote / sizeof(c16_t));
+  uint blockSz = sz * sizeof(c16_t) + sizeof(headerTx_t);
+  uint8_t buf[blockSz];
+  *(headerTx_t *)buf = (headerTx_t){.control = magic_tx,
+                                    .packetSeqNum = 0x1211,
+                                    .packetSz = 0x0800,
+                                    .seqId = 1,
+                                    .filler = 0x02,
+                                    .markers = 0xb1,
+                                    .filler2 = 0xabcd,
+                                    .txGain = 0x112233,
+                                    .filler3 = 0xf0,
+                                    .ppsOffset = 0x28272625,
+                                    .timestamp = (uint64_t)s->tx_ts};
+  memcpy(buf + sizeof(headerTx_t), samples, sz * sizeof(c16_t));
+  uint64_t start = rdtsc_oai();
+  size_t wrote = write(s->fd_write, buf, blockSz);
+  uint64_t end = rdtsc_oai();
+  if (end - start > 300 * 5000)
+    LOG_E(HW, "one write to xdma took %ld µs, ts:%lu\n", (end - start) / 5000, s->tx_ts);
+  if (wrote != blockSz)
+    LOG_E(HW, "write to SDR failed, request: %u, wrote %ld\n", blockSz, wrote);
   if (wrote < 0)
     LOG_E(HW, "write to %s failed, errno %d:%s\n", s->filename_write, errno, strerror(errno));
-  s->tx_ts += wrote;
+  s->tx_ts += sz;
   s->tx_block_sz = 0;
   s->tx_count++;
-  LOG_D(HW, "wrote at ts: %lu, energy: %u\n", s->tx_ts, signalEnergy((int32_t *)s->tx_block[0], SAMPLE_BUF));
+  LOG_D(HW, "wrote at ts: %lu, energy: %u\n", s->tx_ts, signalEnergy((int32_t *)samples, sz));
+  return sz;
 }
 
 static int oc_write(openair0_device_t *device, openair0_timestamp_t timestamp, void **buff, int nsamps, int cc, int flags)
 {
   oc_state_t *s = (oc_state_t *)device->priv;
   timestamp -= device->openair0_cfg->command_line_sample_advance + device->openair0_cfg->tx_sample_advance;
-  c16_t *in = (c16_t *)buff[0];
 
   if (s->first_tx) {
     s->tx_ts = timestamp;
@@ -250,27 +259,13 @@ static int oc_write(openair0_device_t *device, openair0_timestamp_t timestamp, v
   if (gap)
     LOG_D(HW, "gap of %ld\n", gap);
 
-  while (gap) {
-    int tmp = std::min(gap, (int64_t)SAMPLE_BUF - (int64_t)s->tx_block_sz);
-    memset(s->tx_block[0] + s->tx_block_sz, 0, tmp * sizeof(*in));
-    gap -= tmp;
-    s->tx_block_sz += tmp;
-    if (s->tx_block_sz == SAMPLE_BUF)
-      write_block(s);
-  }
   int wr_sz = nsamps;
   while (wr_sz) {
-    int tmp = std::min((long unsigned int)wr_sz, SAMPLE_BUF - s->tx_block_sz);
-    simde__m256i *sig = (simde__m256i *)(s->tx_block[0] + s->tx_block_sz);
-    if ((intptr_t)sig % 32)
-      abort();
-    for (int j = 0; j < tmp; j += 8)
-      *sig++ = simde_mm256_slli_epi16(simde_mm256_loadu_si256((simde__m256i *)(in + j)), 4);
-    // memcpy(s->tx_block[0] + s->tx_block_sz, in, tmp * sizeof(*in));
-    wr_sz -= tmp;
-    s->tx_block_sz += tmp;
-    if (s->tx_block_sz == SAMPLE_BUF)
-      write_block(s);
+    int tmp = std::min(wr_sz, WRITE_BLOCK_NB_SAMPLES);
+    int sz = write_block(s, ((c16_t *)buff[0]) + nsamps - wr_sz, tmp);
+    if (sz != tmp)
+      LOG_E(HW, "ask to write %d, res is %d\n", tmp, sz);
+    wr_sz -= sz;
   }
   s->tx_ts = timestamp + nsamps;
   return nsamps;
@@ -290,7 +285,7 @@ static void initial_block_align (oc_state_t *s) {
       return;
     }
     int i;
-    header_t *rx = NULL;
+    headerRx_t *rx = NULL;
     for (i = 0; i < READ_BLOCK_NB_SAMPLES + PKT_HEADER_NB_SAMPLES; i++)
       if (b[i] == (magic_rx&UINT32_MAX) && b[i + 1] == ((magic_rx>>32)&UINT32_MAX)) {
 	printf("found first magic at %d (inblock: %d), dist: %d, bytes %lu\n",
@@ -298,8 +293,8 @@ static void initial_block_align (oc_state_t *s) {
 	       i,
 	       idx * (READ_BLOCK_NB_SAMPLES + PKT_OVERHEAD_NB_SAMPLES) + i - old,
 	       bytes);
-	rx = (header_t *)(b + i);
-	dumpHD("first header:", *rx);
+  rx = (headerRx_t *)(b + i);
+  dumpHD("first header:", *rx);
 	break;
       }
     if (i == (READ_BLOCK_NB_SAMPLES + PKT_HEADER_NB_SAMPLES)) {
@@ -317,7 +312,7 @@ static bool get_blocks(oc_state_t *s) {
   static struct timespec last_second={}, origin={};
   static struct timespec now={};
   static uint64_t tot_samples= 0;
-    
+
   int readSz= sizeof(*s->current_rx_packet)* s->nb_blocks_per_read;
   packet_t* p= s->current_rx_packet;
   ssize_t ret = read(s->fd_read, p, readSz);
@@ -339,7 +334,7 @@ static bool get_blocks(oc_state_t *s) {
     printf("avg rate:%f\n",  (float)tot_samples/(now.tv_sec*1000000 - origin.tv_sec*1000000 +  now.tv_nsec/1000.0 - origin.tv_nsec/1000.0 ));
     last_second.tv_sec++;
   }
-  
+
   for (int i = 0; i <s->nb_blocks_per_read ; i++) {
     if (s->rx_timestamp != (int64_t)p[i].h.timestamp)
       printf("expected ts: %lu got %lu, diff %ld, seq num %d, atomicPacket %d, timerOverflow %d\n",
@@ -353,7 +348,7 @@ static bool get_blocks(oc_state_t *s) {
     if (llabs((int64_t)s->lastPpsOffset - (int64_t)p[i].h.ppsOffset) > 12)
       // pps_in is based on a real pulse from the GPS. It may have some jitter and drift during time.
       // Thus it is normal to have some diff between theoretical (expected) and real (measured) values.
-      // >12 -> means that we flag errors higher than +/- 0.1ppm.
+      // >12 ->l means that we flag errors higher than +/- 0.1ppm.
       // When the board's FPGA starts, the vcxo is not yet discplined to the GPS, thus we may observe
       // some errors until the frequency error algorithm converges
       printf("expected pps offset %u got %u, diff %d, seq num %d\n",
@@ -428,8 +423,8 @@ static int oc_read(openair0_device_t *device, openair0_timestamp_t *ptimestamp, 
 	return 0;
       }
       uint64_t b=rdtsc_oai();
-      if ( b-a > 4200*400)
-	printf("one call to xdma: %ld µs\n", (b-a)/4200);
+      if (b - a > 4200 * 600)
+        printf("one call to xdma: %ld µs\n", (b - a) / 4200);
       a=b;
     }
   }
@@ -542,8 +537,8 @@ static int oc_start(openair0_device_t *device)
   s->nb_blocks_per_read=NB_BLOCKS_PER_READ;
   int nb_tx = device->openair0_cfg->tx_num_channels;
   s->tx_block = (c16_t **)malloc(nb_tx * sizeof(*s->tx_block));
-  for (int i = 0; i < nb_tx; i++)
-    s->tx_block[i] = (c16_t *)malloc16(OC_BUFFER);
+  // for (int i = 0; i < nb_tx; i++)
+  // s->tx_block[i] = (c16_t *)malloc16(OC_BUFFER);
   s->current_rx_packet=(packet_t*)malloc16(s->nb_blocks_per_read*sizeof(* s->current_rx_packet));
   s->fd_write = open(s->filename_write, O_WRONLY);
   if (s->fd_write < 0) {
