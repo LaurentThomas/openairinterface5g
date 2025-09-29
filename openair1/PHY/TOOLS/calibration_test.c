@@ -26,7 +26,7 @@ void nfapi_setmode(nfapi_mode_t nfapi_mode) {}
 void set_taus_seed(unsigned int seed_init){};
 
 // configmodule_interface_t *uniqCfg = NULL;
-const int tx_ahead = DFT * 50;
+const int tx_ahead = DFT * 5;
 openair0_timestamp_t rx_timestamp = 0;
 openair0_timestamp_t tx_timestamp = 0;
 
@@ -36,6 +36,7 @@ void *write_thread(void *arg)
   c16_t **samplesTx = params.samplesTx;
   uint64_t ts = 0;
   for (int i = 0; i < params.dft_sz; i++) {
+    #if 0
     // Better to select a frequency having an integer division with the sampling rate to avoid having DFT leakage later on
     //  .r = cos and .i = sin -> having a positive spectrum
     //  For negative spectrum -> .r = sin and .i = cos
@@ -45,6 +46,8 @@ void *write_thread(void *arg)
     // life
     samplesTx[0][i].r = (samplesTx[0][i].r) * (0.54 - 0.46 * cos(2 * M_PI * 30720 / 122880));
     samplesTx[0][i].i = (samplesTx[0][i].i) * (0.54 - 0.46 * cos(2 * M_PI * 30720 / 122880));
+    #endif
+    samplesTx[0][i]=(c16_t){i,-params.dft_sz+i};
     ts++;
   }
   double avg = 0;
@@ -59,17 +62,14 @@ void *write_thread(void *arg)
   openair0_timestamp_t last_tx_timestamp = 0, new_tx = 0;
 
   while (!oai_exit) {
-    /*
     do {
       pthread_mutex_lock(&params.txMutex);
-      printf("write got lock\n");
       new_tx = tx_timestamp & ~31;
       pthread_mutex_unlock(&params.txMutex);
       if (new_tx == last_tx_timestamp)
-        usleep(5);
+        usleep(20);
     } while (last_tx_timestamp == new_tx);
-    */
-    last_tx_timestamp = new_tx & ~31;
+    last_tx_timestamp = new_tx;
     params.rfdevice->trx_write_func(params.rfdevice, new_tx + tx_ahead, (void **)samplesTx, params.dft_sz, params.antennas, 0);
     count++;
     struct timespec now;
@@ -208,7 +208,7 @@ int main(int argc, char **argv) {
   rfdevice.trx_start_func(&rfdevice);
 
   pthread_t w_thread={};
-  // threadCreate(&w_thread, write_thread, &params, "write_thr", -1, OAI_PRIORITY_RT);
+  threadCreate(&w_thread, write_thread, &params, "write_thr", -1, OAI_PRIORITY_RT);
   pthread_t r_thread;
   threadCreate(&r_thread, read_thread, &params, "read_thr", 2, OAI_PRIORITY_RT);
   (void)pthread_join(w_thread, NULL);
