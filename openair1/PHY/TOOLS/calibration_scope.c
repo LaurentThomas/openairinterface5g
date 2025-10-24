@@ -40,7 +40,7 @@ typedef struct OAIgraph {
   double *waterFallAvg;
   bool initDone;
   int iteration;
-  void (*funct)(struct OAIgraph *graph,struct OAI_phy_scope_s * );
+  void (*funct)(struct OAIgraph *graph, threads_t *, scopeSample_t *timeDomain, scopeSample_t *freqDomain);
 } OAIgraph_t;
 
 
@@ -51,9 +51,7 @@ typedef struct  OAI_phy_scope_s{
   OAIgraph_t graph[20];
   FL_OBJECT *button_0;
   scopeSample_t *timeDomain;
-  scopeSample_t *timeDomainTx;
   scopeSample_t *freqDomain;
-  scopeSample_t *freqDomainTx;
 } OAI_phy_scope_t;
 
 typedef struct {
@@ -106,7 +104,8 @@ static void commonGraph(OAIgraph_t *graph, int type, FL_Coord x, FL_Coord y, FL_
   graph->iteration=0;
 }
 
-static OAIgraph_t calibrationCommonGraph(void (*funct)(OAIgraph_t *graph,OAI_phy_scope_t * scope),
+static OAIgraph_t calibrationCommonGraph(
+    void (*funct)(OAIgraph_t *graph, threads_t *context, scopeSample_t *timeDomain, scopeSample_t *freqDomain),
     int type,
     FL_Coord x,
     FL_Coord y,
@@ -265,35 +264,44 @@ static void genericPowerPerAntena(OAIgraph_t  *graph, const int nb_ant, const sc
   }
 }
 
-static void gNBWaterFall(OAIgraph_t *graph, OAI_phy_scope_t *scope)
+static void gNBWaterFall(OAIgraph_t *graph, threads_t *context, scopeSample_t *timeDomain, scopeSample_t *freqDomain)
 {
   //use 1st antenna
-  genericWaterFall(graph, (scopeSample_t *)context->samplesRx[0], DFT, 10, "X axis:one frame in time");
+  genericWaterFall(graph, timeDomain, DFT, 10, "X axis:one frame in time");
 }
 
-static void spectrum(OAIgraph_t *graph, OAI_phy_scope_t *scope)
-{
-  //use 1st antenna
-  genericWaterFall(graph, (scopeSample_t *)context->samplesRx[0],
-                   0, 0,
-                   "X axis:one frame in time");
-}
-
-
-static void spectrum(OAIgraph_t *graph, threads_t *context)
+static void spectrum(OAIgraph_t *graph, threads_t *context, scopeSample_t *timeDomain, scopeSample_t *freqDomain)
 {
   int len = context->dft_sz;
-  c16_t freqDomain[len] __attribute__((aligned(32)));
-  pthread_mutex_lock(&context->rxMutex);
-  dft(get_dft(len), (int16_t *)context->samplesRx[0], (int16_t *)freqDomain, 1);
-  pthread_mutex_unlock(&context->rxMutex);
-  float *valuesr, *time;
-  oai_xygraph_getbuff(graph, &time, &valuesr, len, 0);
-  const int ant = 0;
-  for (int i = 0; i < len; i++) {
-    valuesr[i] = SquaredNorm(freqDomain[(i + len / 2) % len]);
+  for (int ri = 0; ri < 2; ri++) {
+    float *values;
+    float *time;
+    oai_xygraph_getbuff(graph, &time, &values, len, ri);
+    for (int i = 0; i < len; i++) {
+      values[i] = ri ? freqDomain[(i + len / 2) % len].i : freqDomain[(i + len / 2) % len].r;
+    }
+    oai_xygraph(graph, time, values, len, ri, 1);
   }
-  oai_xygraph(graph, time, valuesr, len, 0, 0);
+}
+
+static void zoomIn(OAIgraph_t *graph, threads_t *context, scopeSample_t *timeDomain, scopeSample_t *freqDomain)
+{
+  static time_t t = 0;
+  time_t n = time(NULL);
+  if (n == t)
+    return;
+  t = n;
+  int len = context->dft_sz;
+  int detailLen = min(len, 600);
+  int beg=max(0, rand()%len - detailLen )/2*2;
+  for (int ri = 0; ri < 2; ri++) {
+    float *values;
+    float *time;
+    oai_xygraph_getbuff(graph, &time, &values, detailLen, ri);
+    for (int i = 0; i < detailLen; i++)
+      values[i] = ri ? timeDomain[beg+i].i : timeDomain[beg+i].r;
+    oai_xygraph(graph, time, values, detailLen, ri, 1);
+  }
 }
 
 __attribute__((unused))
@@ -319,28 +327,15 @@ static void timeResponse(OAIgraph_t *graph, threads_t *context)
 #endif
 }
 
-static void signalIQ(OAIgraph_t *graph,OAI_phy_scope_t *scope)
+static void signalIQ(OAIgraph_t *graph, threads_t *context, scopeSample_t *timeDomain, scopeSample_t *FreqDomain)
 {
-  int len = scope->context->dft_sz;
+  int len = context->dft_sz;
   float *I, *Q;
   oai_xygraph_getbuff(graph, &I, &Q, len, 0);
 
   for (int k = 0; k < len; k++) {
-    I[k] = scope->freqDomain[k].r;
-    Q[k] = scope->freqDomain[k].i;
-  }
-
-  oai_xygraph(graph, I, Q, DFT, 0, 10);
-}
-static void signalIQtx(OAIgraph_t *graph,OAI_phy_scope_t *scope)
-{
-  int len = scope->context->dft_sz;
-  float *I, *Q;
-  oai_xygraph_getbuff(graph, &I, &Q, len, 0);
-
-  for (int k = 0; k < len; k++) {
-    I[k] = scope->freqDomainTx[k].r;
-    Q[k] = scope->freqDomainTx[k].i;
+    I[k] = FreqDomain[k].r;
+    Q[k] = FreqDomain[k].i;
   }
 
   oai_xygraph(graph, I, Q, DFT, 0, 10);
@@ -378,7 +373,7 @@ static OAI_phy_scope_t *createScopeCalibration(threads_t *context)
   // LLR of PUSCH
   //fdui->graph[3] = calibrationCommonGraph( puschLLR, FL_POINTS_XYPLOT, 0, curY, 500, 200, "PUSCH Log-Likelihood Ratios (LLR, mag)", FL_YELLOW );
   // I/Q PUSCH comp
-  *graph++ = calibrationCommonGraph(signalIQ, FL_POINTS_XYPLOT, 500, curY, 300, 300, "I/Q of frequency domain", FL_YELLOW);
+  *graph++ = calibrationCommonGraph(signalIQ, FL_POINTS_XYPLOT, 500, curY, 300, 200, "I/Q of frequency domain", FL_YELLOW);
   fl_get_object_bbox(fdui->graph[2].graph,&x, &y,&w, &h);
   curY+=h;
   //fl_get_object_bbox(fdui->graph[6].graph,&x, &y,&w, &h);
@@ -395,20 +390,14 @@ void calibrationScope(OAI_phy_scope_t  *form) {
     form->freqDomain = malloc16(len * sizeof(*form->freqDomain));
   if (!form->timeDomain)
     form->timeDomain = malloc16(len * sizeof(*form->timeDomain));
-  if (!form->freqDomainTx)
-    form->freqDomainTx = malloc16(len * sizeof(*form->freqDomain));
-  if (!form->timeDomainTx)
-    form->timeDomainTx = malloc16(len * sizeof(*form->timeDomainTx));
   pthread_mutex_lock(&form->context->rxMutex);
   memcpy(form->timeDomain, form->context->samplesRx[0], len * sizeof(*form->timeDomain));
-  memcpy(form->timeDomainTx, form->context->samplesTx[0], len * sizeof(*form->timeDomainTx));
   pthread_mutex_unlock(&form->context->rxMutex);
   dft(get_dft(len), (int16_t *)form->timeDomain, (int16_t *)form->freqDomain, 1);
-  dft(get_dft(len), (int16_t *)form->timeDomainTx, (int16_t *)form->freqDomainTx, 1);
 
   int i = 0;
   while (form->graph[i].graph) {
-    form->graph[i].funct(form->graph + i, form);
+    form->graph[i].funct(form->graph + i, form->context, form->timeDomain, form->freqDomain);
     i++;
   }
 
@@ -441,5 +430,5 @@ void CalibrationInitScope(threads_t *p)
   // calibData_t *tmp = malloc_or_fail(sizeof(*tmp));
   // tmp->samplesRx=samplesRx;
   // tmp->rfdevice=rfdevice;
-  threadCreate(&forms_thread, scopeThread, (void *)p, "scope", -1, OAI_PRIORITY_RT_LOW);
+  threadCreate(&forms_thread, scopeThread, (void *)p, "scope", 7, OAI_PRIORITY_RT_LOW);
 }

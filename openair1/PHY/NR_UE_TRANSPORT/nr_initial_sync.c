@@ -297,7 +297,7 @@ static void nr_scan_ssb(void *arg)
   nr_ue_ssb_scan_t *ssbInfo = (nr_ue_ssb_scan_t *)arg;
   c16_t **rxdata = ssbInfo->rxdata;
   const NR_DL_FRAME_PARMS *fp = ssbInfo->fp;
-
+  LOG_I(PHY, "sync for power %d\n", signal_energy((int32_t *)(rxdata[0]), fp->samples_per_frame));
   // Generate PSS time signal for this GSCN.
   __attribute__((aligned(32))) c16_t pssTime[NUMBER_PSS_SEQUENCE][fp->ofdm_symbol_size];
   const int pss_sequence = get_softmodem_params()->sl_mode == 0 ? NUMBER_PSS_SEQUENCE : NUMBER_PSS_SEQUENCE_SL;

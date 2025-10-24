@@ -284,7 +284,8 @@ static void oai_xygraph_getbuff(OAIgraph_t *graph, float **x, float **y, int len
 }
 #endif
 
-static void oai_xygraph(OAIgraph_t *graph, float *x, float *y, int len, int layer, bool NoAutoScale) {
+static void oai_xygraph(OAIgraph_t *graph, float *x, float *y, int len, int layer, int NoAutoScale)
+{
 #ifdef WEBSRVSCOPE
   websrv_scopedata_msg_t *msg = NULL;
 
@@ -834,7 +835,7 @@ static void uePbchLLR  (scopeGraphData_t **data, OAIgraph_t *graph, PHY_VARS_NR_
     llr_pbch[i] = llrs[i];
   }
 #endif
-  oai_xygraph(graph, bit_pbch, llr_pbch, nx, 0, 10);
+  oai_xygraph(graph, bit_pbch, llr_pbch, nx, 0, 100);
 }
 
 static void uePbchIQ  (scopeGraphData_t **data, OAIgraph_t *graph, PHY_VARS_NR_UE *phy_vars_ue, int eNB_id, int UE_id) {
@@ -859,7 +860,7 @@ static void uePbchIQ  (scopeGraphData_t **data, OAIgraph_t *graph, PHY_VARS_NR_U
     Q[i]=pbch_comp[i].i;
   }
 #endif
-  oai_xygraph(graph, I, Q, newsz, 0, true);
+  oai_xygraph(graph, I, Q, newsz, 0, 100);
 }
 
 static void uePcchLLR  (scopeGraphData_t **data, OAIgraph_t *graph, PHY_VARS_NR_UE *phy_vars_ue, int eNB_id, int UE_id) {
@@ -883,7 +884,7 @@ static void uePcchLLR  (scopeGraphData_t **data, OAIgraph_t *graph, PHY_VARS_NR_
     llr[i] = (float) pdcch_llr[i];
   }
 #endif
-  oai_xygraph(graph, bit, llr, nx, 0, 10);
+  oai_xygraph(graph, bit, llr, nx, 0, 100);
 }
 static void uePcchIQ  (scopeGraphData_t **data, OAIgraph_t *graph, PHY_VARS_NR_UE *phy_vars_ue, int eNB_id, int UE_id) {
   // PDCCH I/Q of MF Output
@@ -902,8 +903,11 @@ static void uePcchIQ  (scopeGraphData_t **data, OAIgraph_t *graph, PHY_VARS_NR_U
   oai_xygraph_getbuff(graph, &I, &Q, sz, 0);
 
   for (int i=0; i<sz; i++) {
-    I[i] = pdcch_comp[i].r;
-    Q[i] = pdcch_comp[i].i;
+    if (pdcch_comp[i].r < 100 && pdcch_comp[i].i < 100) {
+      I[i] = pdcch_comp[i].r;
+      Q[i] = pdcch_comp[i].i;
+    } else
+      I[i] = Q[i] = 0;
   }
 #endif
   oai_xygraph(graph, I, Q, newsz, 0, 10);

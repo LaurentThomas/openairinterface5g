@@ -146,7 +146,7 @@ int openair0_transport_load(openair0_device_t *device, openair0_config_t *openai
 static void writerEnqueue(re_order_t *ctx, openair0_timestamp_t timestamp, void **txp, int nsamps, int nbAnt, int flags)
 {
   pthread_mutex_lock(&ctx->mutex_store);
-  LOG_D(HW, "Enqueue write for TS: %lu\n", timestamp);
+  // LOG_W(HW, "Enqueue write for TS: %lu to %lu\n", timestamp, timestamp + nsamps);
   int i;
   for (i = 0; i < WRITE_QUEUE_SZ; i++)
     if (!ctx->queue[i].active) {
