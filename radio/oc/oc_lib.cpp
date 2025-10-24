@@ -26,9 +26,10 @@
 
 #define DEVICE_WRITE_DEFAULT "/dev/xdma0_h2c_0"
 #define DEVICE_READ_DEFAULT "/dev/xdma0_c2h_0"
-#define WRITE_BLOCK_NB_SAMPLES 2048
-#define NB_BLOCKS_PER_READ 16
+#define NB_BLOCKS_PER_READ 8
 #define READ_BLOCK_NB_SAMPLES 2048
+#define NB_BLOCKS_PER_WRITE 8
+#define WRITE_BLOCK_NB_SAMPLES 2048
 #define PKT_HEADER_NB_SAMPLES 7
 #define PKT_FOOTER_NB_SAMPLES 1
 #define PKT_OVERHEAD_NB_SAMPLES (PKT_HEADER_NB_SAMPLES + PKT_FOOTER_NB_SAMPLES)
@@ -83,7 +84,13 @@ typedef struct {
   headerRx_t h;
   uint32_t b[READ_BLOCK_NB_SAMPLES];
   footer_t f;
-} __attribute__((packed)) packet_t;
+} __attribute__((packed)) rx_packet_t;
+
+typedef struct {
+  headerTx_t h;
+  uint32_t b[WRITE_BLOCK_NB_SAMPLES];
+  // footer_t f;
+} __attribute__((packed)) tx_packet_t;
 
 static inline void dumpHD(std::string ctx, headerRx_t h)
 {
@@ -126,16 +133,18 @@ typedef struct {
   int wait_for_first_pps;
   int use_gps;
   openair0_timestamp_t rx_timestamp;
+  openair0_timestamp_t rx_ts_interface;
   openair0_timestamp_t tx_ts;
-  c16_t **tx_block;
-  size_t tx_block_sz;
+  uint64_t gap;
+  tx_packet_t **tx_block;
+  size_t tx_block_pos;
   bool first_tx;
   bool rxMagicFound;
   uint seqNum;
   uint lastPpsOffset;
   int  nb_blocks_per_read;
   int remain_samples;
-  packet_t *current_rx_packet;
+  rx_packet_t *rx_live;
 } oc_state_t;
 
 typedef struct {
@@ -210,33 +219,36 @@ static int32_t signalEnergy(int32_t *input, uint32_t length)
 // DC-filter: 0 will be done in FPGA after seeing 128-consecutive samples having the same value
 static inline int write_block(oc_state_t *s, c16_t *samples, uint sz)
 {
-  uint blockSz = sz * sizeof(c16_t) + sizeof(headerTx_t);
-  uint8_t buf[blockSz];
-  *(headerTx_t *)buf = (headerTx_t){.control = magic_tx,
-                                    .packetSeqNum = 0x1211,
-                                    .packetSz = 0x0800,
-                                    .seqId = 1,
-                                    .filler = 0x02,
-                                    .markers = 0xb1,
-                                    .filler2 = 0xabcd,
-                                    .txGain = 0x112233,
-                                    .filler3 = 0xf0,
-                                    .ppsOffset = 0x28272625,
-                                    .timestamp = (uint64_t)s->tx_ts};
-  memcpy(buf + sizeof(headerTx_t), samples, sz * sizeof(c16_t));
-  uint64_t start = rdtsc_oai();
-  size_t wrote = write(s->fd_write, buf, blockSz);
-  uint64_t end = rdtsc_oai();
-  if (end - start > 300 * 5000)
-    LOG_E(HW, "one write to xdma took %ld µs, ts:%lu\n", (end - start) / 5000, s->tx_ts);
-  if (wrote != blockSz)
-    LOG_E(HW, "write to SDR failed, request: %u, wrote %ld\n", blockSz, wrote);
-  if (wrote < 0)
-    LOG_E(HW, "write to %s failed, errno %d:%s\n", s->filename_write, errno, strerror(errno));
+  tx_packet_t *ant0 = s->tx_block[0] + s->tx_block_pos;
+  ant0->h = (headerTx_t){.control = magic_tx,
+                         .packetSeqNum = 0x1211,
+                         .packetSz = 0x0800,
+                         .seqId = 1,
+                         .filler = 0x02,
+                         .markers = 0xb1,
+                         .filler2 = 0xabcd,
+                         .txGain = 0x112233,
+                         .filler3 = 0xf0,
+                         .ppsOffset = 0x28272625,
+                         .timestamp = (uint64_t)s->tx_ts};
+  memcpy(ant0->b, samples, sz * sizeof(c16_t));
   s->tx_ts += sz;
-  s->tx_block_sz = 0;
+  s->tx_block_pos++;
   s->tx_count++;
-  LOG_D(HW, "wrote at ts: %lu, energy: %u\n", s->tx_ts, signalEnergy((int32_t *)samples, sz));
+  if (s->tx_block_pos == NB_BLOCKS_PER_WRITE) {
+    uint64_t start = rdtsc_oai();
+    size_t wrote = write(s->fd_write, s->tx_block[0], sizeof(tx_packet_t) * NB_BLOCKS_PER_WRITE);
+    uint64_t end = rdtsc_oai();
+    if (end - start > 200 * 5000)
+      LOG_E(HW, "one write to xdma took %ld µs, ts:%lu\n", (end - start) / 5000, s->tx_ts);
+    if (wrote != sizeof(tx_packet_t) * NB_BLOCKS_PER_WRITE)
+      LOG_E(HW, "write to SDR failed, request: %lu, wrote %ld\n", sizeof(tx_packet_t) * NB_BLOCKS_PER_WRITE, wrote);
+    if (wrote < 0)
+      LOG_E(HW, "write to %s failed, errno %d:%s\n", s->filename_write, errno, strerror(errno));
+    LOG_D(HW, "wrote at ts: %lu, energy: %u\n", s->tx_ts, signalEnergy((int32_t *)samples, sz));
+    s->tx_block_pos = 0;
+  }
+  // LOG_I(HW,".");
   return sz;
 }
 
@@ -257,10 +269,13 @@ static int oc_write(openair0_device_t *device, openair0_timestamp_t timestamp, v
   }
 
   if (gap)
-    LOG_D(HW, "gap of %ld\n", gap);
+    LOG_I(HW, "gap of %ld\n", gap);
+  else
+    LOG_D(HW, ".\n");
 
   int wr_sz = nsamps;
-  while (wr_sz) {
+  // LOG_E(HW, "ask to write %d\n", wr_sz);
+  while (wr_sz > 0) {
     int tmp = std::min(wr_sz, WRITE_BLOCK_NB_SAMPLES);
     int sz = write_block(s, ((c16_t *)buff[0]) + nsamps - wr_sz, tmp);
     if (sz != tmp)
@@ -272,40 +287,41 @@ static int oc_write(openair0_device_t *device, openair0_timestamp_t timestamp, v
 }
 
 static void initial_block_align (oc_state_t *s) {
-  printf("Synchronizing rx\n");
+  LOG_I(HW, "Synchronizing rx\n");
   __attribute__ ((aligned(32))) uint32_t b[READ_BLOCK_NB_SAMPLES + PKT_OVERHEAD_NB_SAMPLES];
   int idx = 0;
   int old = 0;
   uint64_t bytes = 0;
   //while (1) {
   ssize_t ret = read(s->fd_read, b, sizeof(b));
-    if (ret != sizeof(b)) {
-      printf("Error reading %ld bytes: %ld\n",sizeof(b), ret);
-      usleep(10000);
-      return;
+  if (ret != sizeof(b)) {
+    LOG_E(HW, "Error reading %ld bytes: %ld (%s)\n", sizeof(b), ret, strerror(errno));
+    usleep(10000);
+    return;
+  }
+  int i;
+  headerRx_t *rx = NULL;
+  for (i = 0; i < READ_BLOCK_NB_SAMPLES + PKT_HEADER_NB_SAMPLES; i++)
+    if (b[i] == (magic_rx & UINT32_MAX) && b[i + 1] == ((magic_rx >> 32) & UINT32_MAX)) {
+      LOG_D(HW,
+            "found first magic at %d (inblock: %d), dist: %d, bytes %lu\n",
+            idx * (READ_BLOCK_NB_SAMPLES + PKT_OVERHEAD_NB_SAMPLES) + i,
+            i,
+            idx * (READ_BLOCK_NB_SAMPLES + PKT_OVERHEAD_NB_SAMPLES) + i - old,
+            bytes);
+      rx = (headerRx_t *)(b + i);
+      dumpHD("first header:", *rx);
+      break;
     }
-    int i;
-    headerRx_t *rx = NULL;
-    for (i = 0; i < READ_BLOCK_NB_SAMPLES + PKT_HEADER_NB_SAMPLES; i++)
-      if (b[i] == (magic_rx&UINT32_MAX) && b[i + 1] == ((magic_rx>>32)&UINT32_MAX)) {
-	printf("found first magic at %d (inblock: %d), dist: %d, bytes %lu\n",
-	       idx * (READ_BLOCK_NB_SAMPLES+ PKT_OVERHEAD_NB_SAMPLES) + i,
-	       i,
-	       idx * (READ_BLOCK_NB_SAMPLES + PKT_OVERHEAD_NB_SAMPLES) + i - old,
-	       bytes);
-  rx = (headerRx_t *)(b + i);
-  dumpHD("first header:", *rx);
-	break;
-      }
-    if (i == (READ_BLOCK_NB_SAMPLES + PKT_HEADER_NB_SAMPLES)) {
-      printf("%%error magic not found\n");
-      return;
-    }
-    ret = read(s->fd_read, b, i * sizeof(*b));
-    s->seqNum = rx->packetSeqNum + 1;
-    s->rx_timestamp = (int64_t)rx->timestamp + rx->packetSz;
-    s->rx_count = 1;
-    //}
+  if (i == (READ_BLOCK_NB_SAMPLES + PKT_HEADER_NB_SAMPLES)) {
+    LOG_E(HW, "%%error magic not found\n");
+    return;
+  }
+  ret = read(s->fd_read, b, i * sizeof(*b));
+  s->seqNum = rx->packetSeqNum + 1;
+  s->rx_timestamp = (int64_t)rx->timestamp + rx->packetSz;
+  s->rx_ts_interface = rx->timestamp;
+  s->rx_count = 1;
 }
 
 static bool get_blocks(oc_state_t *s) {
@@ -313,11 +329,11 @@ static bool get_blocks(oc_state_t *s) {
   static struct timespec now={};
   static uint64_t tot_samples= 0;
 
-  int readSz= sizeof(*s->current_rx_packet)* s->nb_blocks_per_read;
-  packet_t* p= s->current_rx_packet;
+  int readSz = sizeof(*s->rx_live) * s->nb_blocks_per_read;
+  rx_packet_t *p = s->rx_live;
   ssize_t ret = read(s->fd_read, p, readSz);
   if (ret != readSz || p[0].h.control != magic_rx) {
-    printf((char *)"Error reading header asked for %d bytes, got %ld, magic: %lx\n", readSz, ret,  p[0].h.control);
+    LOG_E(HW, "Error reading header asked for %d bytes, got %ld, magic: %lx\n", readSz, ret, p[0].h.control);
     dumpHD("lost good header:", p[0].h);
     // abort();
     s->rx_count = -1;
@@ -331,20 +347,24 @@ static bool get_blocks(oc_state_t *s) {
   }
   tot_samples+= NB_BLOCKS_PER_READ * READ_BLOCK_NB_SAMPLES;
   if (now.tv_sec != last_second.tv_sec) {
-    printf("avg rate:%f\n",  (float)tot_samples/(now.tv_sec*1000000 - origin.tv_sec*1000000 +  now.tv_nsec/1000.0 - origin.tv_nsec/1000.0 ));
+    LOG_I(HW,
+          "driver avg read rate:%f\n",
+          (float)tot_samples / (now.tv_sec * 1000000 - origin.tv_sec * 1000000 + now.tv_nsec / 1000.0 - origin.tv_nsec / 1000.0));
     last_second.tv_sec++;
   }
 
   for (int i = 0; i <s->nb_blocks_per_read ; i++) {
     if (s->rx_timestamp != (int64_t)p[i].h.timestamp)
-      printf("expected ts: %lu got %lu, diff %ld, seq num %d, atomicPacket %d, timerOverflow %d\n",
-	     s->rx_timestamp,
-	     p[i].h.timestamp,
-	     (int64_t)p[i].h.timestamp - s->rx_timestamp,
-	     s->seqNum,
-	     (~p[i].f.atomicPacket &0x01),
-	     p[i].f.timerOverflow);
+      LOG_W(HW,
+            "expected ts: %lu got %lu, diff %ld, seq num %d, atomicPacket %d, timerOverflow %d\n",
+            s->rx_timestamp,
+            p[i].h.timestamp,
+            (int64_t)p[i].h.timestamp - s->rx_timestamp,
+            s->seqNum,
+            (~p[i].f.atomicPacket & 0x01),
+            p[i].f.timerOverflow);
     s->rx_timestamp=p[i].h.timestamp + READ_BLOCK_NB_SAMPLES;
+    /*
     if (llabs((int64_t)s->lastPpsOffset - (int64_t)p[i].h.ppsOffset) > 12)
       // pps_in is based on a real pulse from the GPS. It may have some jitter and drift during time.
       // Thus it is normal to have some diff between theoretical (expected) and real (measured) values.
@@ -352,44 +372,48 @@ static bool get_blocks(oc_state_t *s) {
       // When the board's FPGA starts, the vcxo is not yet discplined to the GPS, thus we may observe
       // some errors until the frequency error algorithm converges
       printf("expected pps offset %u got %u, diff %d, seq num %d\n",
-	     s->lastPpsOffset,
-	     p[i].h.ppsOffset,
-	     p[i].h.ppsOffset- s->lastPpsOffset,
-	     s->seqNum);
-    s->lastPpsOffset = (p[i].h.ppsOffset + READ_BLOCK_NB_SAMPLES )% 122880000 ;
-    if (!p[i].h.ppsAlive)
-      printf("pps not alive\n");
+      s->lastPpsOffset,
+      p[i].h.ppsOffset,
+       p[i].h.ppsOffset- s->lastPpsOffset,
+       s->seqNum);
+       s->lastPpsOffset = (p[i].h.ppsOffset + READ_BLOCK_NB_SAMPLES )% 122880000 ;
+       if (!p[i].h.ppsAlive)
+       printf("pps not alive\n");
+    */
+    if (p[i].h.TXlate)
+      LOG_W(HW, "TXlate\n");
+    // if (p[i].h.TXseqerr)
+    // LOG_W(HW,"TXseqerr\n");
     if (p[i].f.control1 != magic_footer1 || p[i].f.control2 != magic_footer2)
-      printf("footer error\n");
+      LOG_W(HW, "footer error\n");
     if (p[i].f.timerOverflow)
-      printf("timerOverflow\n");
-    if (p[i].f.atomicPacket) {
-      printf("Not atomic\n");
-      }
+      LOG_W(HW, "timerOverflow\n");
+    if (p[i].f.atomicPacket)
+      LOG_W(HW, "Not atomic\n");
+
     static int last_filler = 0;
     if (last_filler != p[i].f.filler)
-      printf("filler changed to %x\n", p[i].f.filler);
+      LOG_I(HW, "filler changed to %x\n", p[i].f.filler);
     last_filler = p[i].f.filler;
     if (s->seqNum % 65536 != p[i].h.packetSeqNum) {
-      printf("expected packet sequence number %u got %u, diff %d\n",
-	     s->seqNum,
-	     p[i].h.packetSeqNum,
-	     p[i].h.packetSeqNum - s->seqNum);
+      LOG_W(HW,
+            "expected packet sequence number %u got %u, diff %d\n",
+            s->seqNum,
+            p[i].h.packetSeqNum,
+            p[i].h.packetSeqNum - s->seqNum);
       s->seqNum = p[i].h.packetSeqNum;
       //s->rx_count = -1;
       //return false;
     }
     s->seqNum++;
   }
-  s->remain_samples= sizeof(s->current_rx_packet->b) * s->nb_blocks_per_read / sizeof(*s->current_rx_packet->b);
-  //printf("got %d samples\n",  s->remain_samples);
+  s->remain_samples = sizeof(s->rx_live->b) * s->nb_blocks_per_read / sizeof(*s->rx_live->b);
   return true;
 }
 
 static int oc_read(openair0_device_t *device, openair0_timestamp_t *ptimestamp, void **buff, int nsamps, int cc)
 {
   oc_state_t *s = (oc_state_t *)device->priv;
-
   if (s->rx_count == -1)
     initial_block_align(s);
   if (s->rx_count == -1)
@@ -399,24 +423,45 @@ static int oc_read(openair0_device_t *device, openair0_timestamp_t *ptimestamp, 
   int remain_to_get=nsamps;
   while (remain_to_get > 0) {
     while (s->remain_samples > 0 && remain_to_get > 0) {
-      packet_t* p=s->current_rx_packet;
-      int nb_samples_per_packet=sizeof(p->b)/sizeof(*p->b);
+      if (s->gap) {
+        c16_t *out = output[0] + nsamps - remain_to_get;
+        while (s->gap && remain_to_get) {
+          *out++ = {};
+          remain_to_get--;
+          s->gap--;
+          s->rx_ts_interface++;
+        }
+      }
+      rx_packet_t *last_rx = s->rx_live;
+      int nb_samples_per_packet = sizeof(last_rx[0].b) / sizeof(last_rx[0].b[0]);
       int nb_samples=nb_samples_per_packet*s->nb_blocks_per_read;
-      int consumed_samples=nb_samples-s->remain_samples;
-      int bloc=consumed_samples/nb_samples_per_packet;
+      int consumed_samples = nb_samples - s->remain_samples;
       int nb_consumed_samples_in_block= consumed_samples%nb_samples_per_packet;
+      int bloc = consumed_samples / nb_samples_per_packet;
+      rx_packet_t *cur_pkt = last_rx + bloc;
+      if (nb_consumed_samples_in_block == 0 && cur_pkt->h.timestamp != (uint64_t)s->rx_ts_interface) {
+        s->gap = cur_pkt->h.timestamp - s->rx_ts_interface;
+        if (s->gap > 0 && s->gap < 1228800) {
+          LOG_W(HW, "gap of %ld, we fill \n", s->gap);
+          continue;
+        } else {
+          LOG_W(HW, "gap of %ld, we break timestamp sequence %lu !=  %lu\n", s->gap, s->rx_ts_interface, cur_pkt->h.timestamp);
+          s->rx_ts_interface = cur_pkt->h.timestamp;
+          s->gap = 0;
+        }
+      }
       int remaing_samples_in_block= nb_samples_per_packet-nb_consumed_samples_in_block;
       int toCopy=std::min(remaing_samples_in_block,remain_to_get );
-      memcpy(output[0]+nsamps-remain_to_get,p[bloc].b+nb_consumed_samples_in_block,toCopy*sizeof(*p->b));
+      memcpy(output[0] + nsamps - remain_to_get, cur_pkt->b + nb_consumed_samples_in_block, toCopy * sizeof(cur_pkt->b[0]));
       s->remain_samples-=toCopy;
-      remain_to_get -=toCopy;
-      *ptimestamp = s->rx_timestamp;
+      remain_to_get -= toCopy;
+      s->rx_ts_interface += toCopy;
     }
     if(  remain_to_get > 0 ) {
       static uint64_t a;
       uint64_t n=rdtsc_oai();
-      if (n-a > 4200*100)
-	printf("blocked for %ld\n", (n-a)/4200);
+      if (n - a > 4200 * 200)
+        printf("blocked for %ld\n", (n - a) / 4200);
       a=n;
       if (!get_blocks(s)) {
 	printf("getblocks returned bad\n");
@@ -428,16 +473,18 @@ static int oc_read(openair0_device_t *device, openair0_timestamp_t *ptimestamp, 
       a=b;
     }
   }
+  *ptimestamp = s->rx_ts_interface;
   return nsamps;
 }
 
 static int oc_set_freq(openair0_device_t *device, openair0_config_t *openair0_cfg)
 {
   // oc_state_t *s = (oc_state_t *)device->priv;
-  printf("Setting TX Freq %f, RX Freq %f, tune_offset: %f\n",
-         openair0_cfg[0].tx_freq[0],
-         openair0_cfg[0].rx_freq[0],
-         openair0_cfg[0].tune_offset);
+  LOG_I(HW,
+        "Setting TX Freq %f, RX Freq %f, tune_offset: %f\n",
+        openair0_cfg[0].tx_freq[0],
+        openair0_cfg[0].rx_freq[0],
+        openair0_cfg[0].tune_offset);
   return 0;
 }
 
@@ -536,10 +583,10 @@ static int oc_start(openair0_device_t *device)
   s->first_tx = true;
   s->nb_blocks_per_read=NB_BLOCKS_PER_READ;
   int nb_tx = device->openair0_cfg->tx_num_channels;
-  s->tx_block = (c16_t **)malloc(nb_tx * sizeof(*s->tx_block));
-  // for (int i = 0; i < nb_tx; i++)
-  // s->tx_block[i] = (c16_t *)malloc16(OC_BUFFER);
-  s->current_rx_packet=(packet_t*)malloc16(s->nb_blocks_per_read*sizeof(* s->current_rx_packet));
+  s->tx_block = (tx_packet_t **)malloc(nb_tx * sizeof(*s->tx_block));
+  for (int i = 0; i < nb_tx; i++)
+    s->tx_block[i] = (tx_packet_t *)malloc16(NB_BLOCKS_PER_WRITE * sizeof(tx_packet_t));
+  s->rx_live = (rx_packet_t *)malloc16(s->nb_blocks_per_read * sizeof(*s->rx_live));
   s->fd_write = open(s->filename_write, O_WRONLY);
   if (s->fd_write < 0) {
     LOG_E(HW, "Open %s failed, errno %d:%s\n", s->filename_write, errno, strerror(errno));
