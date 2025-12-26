@@ -1,20 +1,25 @@
 /*
  * Licensed by open cells project
  */
-#include <string.h>
-#include <pthread.h>
-#include <unistd.h>
-#include <stdio.h>
 #include <iostream>
 #include <complex>
 #include <fstream>
 #include <cmath>
+#include <cassert>
+#include <queue>
+#include <condition_variable>
+#include <mutex>
+
+#include <string.h>
+#include <pthread.h>
+#include <unistd.h>
+#include <stdio.h>
 #include <time.h>
 #ifdef OAI_INTEGRATION
 #include "common_lib.h"
 #include "assertions.h"
 #else
-//#define LOG_E(m, a...) printf(a)
+// #define LOG_E(m, a...) printf(a)
 #include "common_lib.h"
 #endif
 #include "system.h"
@@ -23,6 +28,52 @@
 #include "openair1/PHY/sse_intrin.h"
 #include "common/utils/LOG/log.h"
 #include "common/utils/time_meas.h"
+
+// Thread-safe queue
+template <typename T>
+class TSQueue {
+ private:
+  // Underlying queue
+
+  // mutex for thread synchronization
+  std::mutex m_mutex;
+
+  // Condition variable for signaling
+  std::condition_variable m_cond;
+
+ public:
+  std::queue<T> m_queue;
+  // Pushes an element to the queue
+  void push(T item)
+  {
+    // Acquire lock
+    std::unique_lock<std::mutex> lock(m_mutex);
+
+    // Add item
+    m_queue.push(item);
+
+    // Notify one thread that
+    // is waiting
+    m_cond.notify_one();
+  }
+
+  // Pops an element off the queue
+  T pop()
+  {
+    // acquire lock
+    std::unique_lock<std::mutex> lock(m_mutex);
+
+    // wait until queue is not empty
+    m_cond.wait(lock, [this]() { return !m_queue.empty(); });
+
+    // retrieve item
+    T item = m_queue.front();
+    m_queue.pop();
+
+    // return item
+    return item;
+  }
+};
 
 #define DEVICE_WRITE_DEFAULT "/dev/xdma0_h2c_0"
 #define DEVICE_READ_DEFAULT "/dev/xdma0_c2h_0"
@@ -37,6 +88,7 @@ static const uint64_t magic_tx = 0xA5A50be3A5A5A5A5LL;
 static const uint64_t magic_rx = 0xA5A50be3A5A5A5A5LL;
 static const uint32_t magic_footer1 = 0xce11;
 static const uint32_t magic_footer2 = 0x5A;
+static const uint64_t tx_ahead = WRITE_BLOCK_NB_SAMPLES * NB_BLOCKS_PER_WRITE * 2;
 
 typedef struct {
   uint64_t control;
@@ -82,13 +134,13 @@ typedef struct {
 
 typedef struct {
   headerRx_t h;
-  uint32_t b[READ_BLOCK_NB_SAMPLES];
+  c16_t b[READ_BLOCK_NB_SAMPLES];
   footer_t f;
 } __attribute__((packed)) rx_packet_t;
 
 typedef struct {
   headerTx_t h;
-  uint32_t b[WRITE_BLOCK_NB_SAMPLES];
+  c16_t b[WRITE_BLOCK_NB_SAMPLES];
   // footer_t f;
 } __attribute__((packed)) tx_packet_t;
 
@@ -136,8 +188,11 @@ typedef struct {
   openair0_timestamp_t rx_ts_interface;
   openair0_timestamp_t tx_ts;
   uint64_t gap;
-  tx_packet_t **tx_block;
+  tx_packet_t *tx_block;
   size_t tx_block_pos;
+  TSQueue<tx_packet_t *> *ready_tx;
+  TSQueue<uint64_t> *last_rx;
+  TSQueue<rx_packet_t *> *read_queue;
   bool first_tx;
   bool rxMagicFound;
   uint seqNum;
@@ -145,6 +200,10 @@ typedef struct {
   int  nb_blocks_per_read;
   int remain_samples;
   rx_packet_t *rx_live;
+  uint txLate;
+  uint txErr;
+  uint timerOverflow;
+  uint atomicPacket;
 } oc_state_t;
 
 typedef struct {
@@ -165,30 +224,27 @@ static int sync_to_gps(openair0_device_t *device)
 
 void *write_thread(void *arg)
 {
-  // threads_t params = *(threads_t *)arg;
+  oc_state_t *s = (oc_state_t *)arg;
+  uint64_t last_rx = s->last_rx->pop();
+  do {
+    tx_packet_t *p = s->ready_tx->pop();
+    if (last_rx + tx_ahead < p->h.timestamp)
+      LOG_D(HW, "tx is too ahead, waiting, %lu, %ld\n", p->h.timestamp, p->h.timestamp - last_rx);
+    while (last_rx + tx_ahead < p->h.timestamp) {
+      last_rx = s->last_rx->pop();
+      LOG_D(HW, "pop rx: %lu, rx q sz %lu, tx q sz %lu\n", last_rx, s->last_rx->m_queue.size(), s->ready_tx->m_queue.size());
+    }
 
+    size_t wrote = write(s->fd_write, p, sizeof(tx_packet_t) * NB_BLOCKS_PER_WRITE);
+    if (wrote != sizeof(tx_packet_t) * NB_BLOCKS_PER_WRITE)
+      LOG_E(HW, "write to SDR failed, request: %lu, wrote %ld\n", sizeof(tx_packet_t) * NB_BLOCKS_PER_WRITE, wrote);
+    if (wrote < 0)
+      LOG_E(HW, "write to %s failed, errno %d:%s\n", s->filename_write, errno, strerror(errno));
+    LOG_D(HW, "wrote: %lu\n", p->h.timestamp);
+    free(p);
+  } while (true);
   return NULL;
 }
-
-void *read_thread(void *arg)
-{
-  // threads_t params = *(threads_t *)arg;
-  return NULL;
-}
-
-#if 0
-//TEST 4G 20MHz
-int nsamps2 = (nsamps*4) / 8 ;
-simde__m256i buff_tx[nsamps2];
-simde__m256i *out=buff_tx;
-int *in=(int *)buff[0];
-// bring RX data into 12 LSBs for softmodem RX
-for (uint j = 0; j < nsamps/2; j++) {
-  simde__m256i tmp=simde_mm256_set_epi32(in[1],in[1],in[1],in[1], in[0],in[0],in[0],in[0]);
-  in+=2;
-  *out++ = simde_mm256_slli_epi16(tmp, 6);
- }
-#endif
 
 static int32_t signalEnergy(int32_t *input, uint32_t length)
 {
@@ -219,9 +275,12 @@ static int32_t signalEnergy(int32_t *input, uint32_t length)
 // DC-filter: 0 will be done in FPGA after seeing 128-consecutive samples having the same value
 static inline int write_block(oc_state_t *s, c16_t *samples, uint sz)
 {
-  tx_packet_t *ant0 = s->tx_block[0] + s->tx_block_pos;
+  if (!s->tx_block) {
+    s->tx_block = (tx_packet_t *)malloc16(NB_BLOCKS_PER_WRITE * sizeof(tx_packet_t));
+  }
+  tx_packet_t *ant0 = s->tx_block + s->tx_block_pos;
   ant0->h = (headerTx_t){.control = magic_tx,
-                         .packetSeqNum = 0x1211,
+                         .packetSeqNum = s->txSeq++,
                          .packetSz = 0x0800,
                          .seqId = 1,
                          .filler = 0x02,
@@ -231,24 +290,17 @@ static inline int write_block(oc_state_t *s, c16_t *samples, uint sz)
                          .filler3 = 0xf0,
                          .ppsOffset = 0x28272625,
                          .timestamp = (uint64_t)s->tx_ts};
-  memcpy(ant0->b, samples, sz * sizeof(c16_t));
+  for (uint i = 0; i < sz; i++)
+    ant0->b[i] = (c16_t){(int16_t)(samples[i].r << 0), (int16_t)(samples[i].i << 0)};
+  // memcpy(ant0->b, samples, sz * sizeof(c16_t));
   s->tx_ts += sz;
   s->tx_block_pos++;
   s->tx_count++;
   if (s->tx_block_pos == NB_BLOCKS_PER_WRITE) {
-    uint64_t start = rdtsc_oai();
-    size_t wrote = write(s->fd_write, s->tx_block[0], sizeof(tx_packet_t) * NB_BLOCKS_PER_WRITE);
-    uint64_t end = rdtsc_oai();
-    if (end - start > 200 * 5000)
-      LOG_E(HW, "one write to xdma took %ld µs, ts:%lu\n", (end - start) / 5000, s->tx_ts);
-    if (wrote != sizeof(tx_packet_t) * NB_BLOCKS_PER_WRITE)
-      LOG_E(HW, "write to SDR failed, request: %lu, wrote %ld\n", sizeof(tx_packet_t) * NB_BLOCKS_PER_WRITE, wrote);
-    if (wrote < 0)
-      LOG_E(HW, "write to %s failed, errno %d:%s\n", s->filename_write, errno, strerror(errno));
-    LOG_D(HW, "wrote at ts: %lu, energy: %u\n", s->tx_ts, signalEnergy((int32_t *)samples, sz));
+    s->ready_tx->push(s->tx_block);
     s->tx_block_pos = 0;
+    s->tx_block = NULL;
   }
-  // LOG_I(HW,".");
   return sz;
 }
 
@@ -277,6 +329,8 @@ static int oc_write(openair0_device_t *device, openair0_timestamp_t timestamp, v
   // LOG_E(HW, "ask to write %d\n", wr_sz);
   while (wr_sz > 0) {
     int tmp = std::min(wr_sz, WRITE_BLOCK_NB_SAMPLES);
+    if (tmp != WRITE_BLOCK_NB_SAMPLES)
+      LOG_E(HW, "Error block size: %d\n", nsamps);
     int sz = write_block(s, ((c16_t *)buff[0]) + nsamps - wr_sz, tmp);
     if (sz != tmp)
       LOG_E(HW, "ask to write %d, res is %d\n", tmp, sz);
@@ -324,13 +378,13 @@ static void initial_block_align (oc_state_t *s) {
   s->rx_count = 1;
 }
 
-static bool get_blocks(oc_state_t *s) {
+static bool get_blocks(oc_state_t *s, rx_packet_t *p)
+{
   static struct timespec last_second={}, origin={};
   static struct timespec now={};
   static uint64_t tot_samples= 0;
 
   int readSz = sizeof(*s->rx_live) * s->nb_blocks_per_read;
-  rx_packet_t *p = s->rx_live;
   ssize_t ret = read(s->fd_read, p, readSz);
   if (ret != readSz || p[0].h.control != magic_rx) {
     LOG_E(HW, "Error reading header asked for %d bytes, got %ld, magic: %lx\n", readSz, ret, p[0].h.control);
@@ -348,8 +402,15 @@ static bool get_blocks(oc_state_t *s) {
   tot_samples+= NB_BLOCKS_PER_READ * READ_BLOCK_NB_SAMPLES;
   if (now.tv_sec != last_second.tv_sec) {
     LOG_I(HW,
-          "driver avg read rate:%f\n",
-          (float)tot_samples / (now.tv_sec * 1000000 - origin.tv_sec * 1000000 + now.tv_nsec / 1000.0 - origin.tv_nsec / 1000.0));
+          "driver avg read rate:%f\n errors during last second: txLate %u, txSeqerr %u, timerOverflow %u, atomicPacket %u, present "
+          "tx seq %u\n\n ",
+          (float)tot_samples / (now.tv_sec * 1000000 - origin.tv_sec * 1000000 + now.tv_nsec / 1000.0 - origin.tv_nsec / 1000.0),
+          s->txLate,
+          s->txErr,
+          s->timerOverflow,
+          s->atomicPacket,
+          s->txSeq);
+    s->txLate = s->txErr = s->timerOverflow = s->atomicPacket = 0;
     last_second.tv_sec++;
   }
 
@@ -380,16 +441,24 @@ static bool get_blocks(oc_state_t *s) {
        if (!p[i].h.ppsAlive)
        printf("pps not alive\n");
     */
-    if (p[i].h.TXlate)
-      LOG_W(HW, "TXlate\n");
-    // if (p[i].h.TXseqerr)
-    // LOG_W(HW,"TXseqerr\n");
+    if (p[i].h.TXlate) {
+      LOG_D(HW, "TXlate\n");
+      s->txLate++;
+    }
+    if (p[i].h.TXseqerr) {
+      LOG_W(HW, "TXseqerr, current tx seq is %u\n", s->txSeq);
+      s->txErr++;
+    }
     if (p[i].f.control1 != magic_footer1 || p[i].f.control2 != magic_footer2)
       LOG_W(HW, "footer error\n");
-    if (p[i].f.timerOverflow)
-      LOG_W(HW, "timerOverflow\n");
-    if (p[i].f.atomicPacket)
-      LOG_W(HW, "Not atomic\n");
+    if (p[i].f.timerOverflow) {
+      LOG_D(HW, "timerOverflow\n");
+      s->timerOverflow++;
+    }
+    if (p[i].f.atomicPacket) {
+      s->atomicPacket++;
+      LOG_D(HW, "Not atomic\n");
+    }
 
     static int last_filler = 0;
     if (last_filler != p[i].f.filler)
@@ -397,7 +466,7 @@ static bool get_blocks(oc_state_t *s) {
     last_filler = p[i].f.filler;
     if (s->seqNum % 65536 != p[i].h.packetSeqNum) {
       LOG_W(HW,
-            "expected packet sequence number %u got %u, diff %d\n",
+            "expected rx packet sequence number %u got %u, diff %d\n",
             s->seqNum,
             p[i].h.packetSeqNum,
             p[i].h.packetSeqNum - s->seqNum);
@@ -407,18 +476,14 @@ static bool get_blocks(oc_state_t *s) {
     }
     s->seqNum++;
   }
-  s->remain_samples = sizeof(s->rx_live->b) * s->nb_blocks_per_read / sizeof(*s->rx_live->b);
+  s->last_rx->push(s->rx_timestamp);
+  LOG_D(HW, "read: %lu\n", s->rx_timestamp);
   return true;
 }
 
 static int oc_read(openair0_device_t *device, openair0_timestamp_t *ptimestamp, void **buff, int nsamps, int cc)
 {
   oc_state_t *s = (oc_state_t *)device->priv;
-  if (s->rx_count == -1)
-    initial_block_align(s);
-  if (s->rx_count == -1)
-    return 0;
-
   c16_t **output=(c16_t**)buff;
   int remain_to_get=nsamps;
   while (remain_to_get > 0) {
@@ -458,19 +523,9 @@ static int oc_read(openair0_device_t *device, openair0_timestamp_t *ptimestamp, 
       s->rx_ts_interface += toCopy;
     }
     if(  remain_to_get > 0 ) {
-      static uint64_t a;
-      uint64_t n=rdtsc_oai();
-      if (n - a > 4200 * 200)
-        printf("blocked for %ld\n", (n - a) / 4200);
-      a=n;
-      if (!get_blocks(s)) {
-	printf("getblocks returned bad\n");
-	return 0;
-      }
-      uint64_t b=rdtsc_oai();
-      if (b - a > 4200 * 600)
-        printf("one call to xdma: %ld µs\n", (b - a) / 4200);
-      a=b;
+      free(s->rx_live);
+      s->rx_live = s->read_queue->pop();
+      s->remain_samples = sizeof(s->rx_live->b) * s->nb_blocks_per_read / sizeof(*s->rx_live->b);
     }
   }
   *ptimestamp = s->rx_ts_interface;
@@ -581,12 +636,11 @@ static int oc_start(openair0_device_t *device)
   s->rx_count = -1;
   s->wait_for_first_pps = 1;
   s->first_tx = true;
-  s->nb_blocks_per_read=NB_BLOCKS_PER_READ;
-  int nb_tx = device->openair0_cfg->tx_num_channels;
-  s->tx_block = (tx_packet_t **)malloc(nb_tx * sizeof(*s->tx_block));
-  for (int i = 0; i < nb_tx; i++)
-    s->tx_block[i] = (tx_packet_t *)malloc16(NB_BLOCKS_PER_WRITE * sizeof(tx_packet_t));
+  s->nb_blocks_per_read = NB_BLOCKS_PER_READ;
   s->rx_live = (rx_packet_t *)malloc16(s->nb_blocks_per_read * sizeof(*s->rx_live));
+  s->ready_tx = new TSQueue<tx_packet_t *>;
+  s->read_queue = new TSQueue<rx_packet_t *>;
+  s->last_rx = new TSQueue<uint64_t>;
   s->fd_write = open(s->filename_write, O_WRONLY);
   if (s->fd_write < 0) {
     LOG_E(HW, "Open %s failed, errno %d:%s\n", s->filename_write, errno, strerror(errno));
@@ -597,13 +651,10 @@ static int oc_start(openair0_device_t *device)
     LOG_E(HW, "Open %s failed, errno %d:%s\n", s->filename_read, errno, strerror(errno));
     exit(1);
   }
-  /*
-    threads_t params = (threads_t){&rfdevice, antennas, DFT};
-    pthread_t w_thread;
-    threadCreate(&w_thread, write_thread, &params, "write_thr", -1, OAI_PRIORITY_RT);
-    pthread_t r_thread;
-    threadCreate(&r_thread, read_thread, &params, "read_thr", -1, OAI_PRIORITY_RT);
-  */
+  pthread_t w_thread;
+  threadCreate(&w_thread, write_thread, s, (char *)"write_thr", -1, OAI_PRIORITY_RT);
+  pthread_t r_thread;
+  threadCreate(&r_thread, read_thread, s, (char *)"read_thr", -1, OAI_PRIORITY_RT);
   oc_set_gains(device, device->openair0_cfg);
   oc_set_freq(device, device->openair0_cfg);
   sync_to_gps(device);
@@ -616,13 +667,7 @@ static void oc_end(openair0_device_t *device)
 {
   if (device == NULL)
     return;
-  oc_state_t *s = (oc_state_t *)device->priv;
-  int nb_tx = device->openair0_cfg->tx_num_channels;
-  if (s && nb_tx > 0) {
-    for (int i = 0; i < nb_tx; i++)
-      free(s->tx_block[i]);
-    free(s->tx_block);
-  }
+  // oc_state_t *s = (oc_state_t *)device->priv;
 }
 
 extern "C" {

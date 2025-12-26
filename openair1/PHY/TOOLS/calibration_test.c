@@ -2,6 +2,7 @@
  * SPDX-License-Identifier: LicenseRef-CSSL-1.0
  */
 
+#define __USE_GNU
 #include <stdint.h>
 #include "openair1/PHY/defs_common.h"
 #include <radio/COMMON/common_lib.h>
@@ -10,6 +11,7 @@
 #include "nfapi/oai_integration/vendor_ext.h"
 #include "common/config/config_userapi.h"
 #include <arpa/inet.h>
+#include <pthread.h>
 
 int oai_exit=false;
 unsigned int mmapped_dma=0;
@@ -45,10 +47,10 @@ pthread_cond_t tx_trig;
 
 void *write_thread(void *arg)
 {
-  threads_t params = *(threads_t *)arg;
-  c16_t **samplesTx = params.samplesTx;
+  threads_t *params = (threads_t *)arg;
+  c16_t **samplesTx = params->samplesTx;
   uint64_t ts = 0;
-  for (int i = 0; i < params.dft_sz; i++) {
+  for (int i = 0; i < params->dft_sz; i++) {
 #if 1
     // Better to select a frequency having an integer division with the sampling rate to avoid having DFT leakage later on
     //  .r = cos and .i = sin -> having a positive spectrum
@@ -57,17 +59,17 @@ void *write_thread(void *arg)
     samplesTx[0][i].i = 32000 * sin((ts * M_PI * 2 * 3072) / 122880); // samplesTx[0][i].r;
     // Hamming Window - to allow some pseudo-continuity between batches as this is not a continuously generated signal as in real
     // life
-    // samplesTx[0][i].r = (samplesTx[0][i].r) * (0.54 - 0.46 * cos(2 * M_PI * i / (params.dft_sz-1)));
-    // samplesTx[0][i].i = (samplesTx[0][i].i) * (0.54 - 0.46 * cos(2 * M_PI * i / (params.dft_sz-1)));
+    // samplesTx[0][i].r = (samplesTx[0][i].r) * (0.54 - 0.46 * cos(2 * M_PI * i / (params->dft_sz-1)));
+    // samplesTx[0][i].i = (samplesTx[0][i].i) * (0.54 - 0.46 * cos(2 * M_PI * i / (params->dft_sz-1)));
 #endif
-    // samplesTx[0][i]=(c16_t){i,-params.dft_sz+i};
+    // samplesTx[0][i]=(c16_t){i,-params->dft_sz+i};
     ts++;
   }
   double avg = 0;
-  for (int i = 0; i < params.dft_sz; i++) {
+  for (int i = 0; i < params->dft_sz; i++) {
     avg += sqrt(squaredMod(samplesTx[0][i]));
   }
-  printf("avg: %f \n", avg / params.dft_sz);
+  printf("avg: %f \n", avg / params->dft_sz);
   uint64_t count = 0;
   struct timespec last_second;
   clock_gettime(CLOCK_REALTIME, &last_second);
@@ -76,21 +78,21 @@ void *write_thread(void *arg)
 
   while (!oai_exit) {
     do {
-      pthread_mutex_lock(&params.txMutex);
-      pthread_cond_wait(&tx_trig, &params.txMutex);
+      AssertFatal(!pthread_mutex_lock(&params->txMutex), "");
+      AssertFatal(!pthread_cond_wait(&tx_trig, &params->txMutex), "");
       new_tx = tx_timestamp & ~31;
-      pthread_mutex_unlock(&params.txMutex);
+      AssertFatal(!pthread_mutex_unlock(&params->txMutex), "");
     } while (last_tx_timestamp == new_tx);
     if (last_tx_timestamp + 8192 != new_tx)
-      LOG_D(HW, "not continuous %ld\n", new_tx - (last_tx_timestamp + params.dft_sz));
+      LOG_D(HW, "not continuous %ld\n", new_tx - (last_tx_timestamp + params->dft_sz));
     if (abs(last_tx_timestamp - new_tx) > 1228800) {
-      LOG_W(HW, "large tx gap %ld\n", new_tx - (last_tx_timestamp + params.dft_sz));
-      last_tx_timestamp = new_tx - params.dft_sz;
+      LOG_W(HW, "large tx gap %ld\n", new_tx - (last_tx_timestamp + params->dft_sz));
+      last_tx_timestamp = new_tx - params->dft_sz;
     }
     do {
-      last_tx_timestamp += params.dft_sz;
-      params.rfdevice
-          ->trx_write_func(params.rfdevice, last_tx_timestamp + tx_ahead, (void **)samplesTx, params.dft_sz, params.antennas, 0);
+      last_tx_timestamp += params->dft_sz;
+      params->rfdevice
+          ->trx_write_func(params->rfdevice, last_tx_timestamp + tx_ahead, (void **)samplesTx, params->dft_sz, params->antennas, 0);
       count++;
     } while (last_tx_timestamp < new_tx);
     last_tx_timestamp = new_tx;
@@ -107,26 +109,30 @@ void *write_thread(void *arg)
 
 void *read_thread(void *arg)
 {
-  threads_t params = *(threads_t *)arg;
-  c16_t **samplesRx = params.samplesRx;
+  threads_t *params = (threads_t *)arg;
+  c16_t **samplesRx = params->samplesRx;
   uint64_t count = 0;
   struct timespec last_second;
   clock_gettime(CLOCK_REALTIME, &last_second);
   while (!oai_exit) {
-    pthread_mutex_lock(&params.rxMutex);
+    AssertFatal(!pthread_mutex_lock(&params->rxMutex), "");
     uint64_t old = rx_timestamp;
-    int ret = params.rfdevice->trx_read_func(params.rfdevice, &rx_timestamp, (void **)samplesRx, params.dft_sz, params.antennas);
-    if (old + params.dft_sz != rx_timestamp)
-      LOG_E(HW, "not continuous rx %ld\n", rx_timestamp - (old + params.dft_sz));
-    pthread_mutex_unlock(&params.rxMutex);
-    if (ret != params.dft_sz)
+    int ret =
+        params->rfdevice->trx_read_func(params->rfdevice, &rx_timestamp, (void **)samplesRx, params->dft_sz, params->antennas);
+    if (old + params->dft_sz != rx_timestamp)
+      LOG_E(HW, "not continuous rx %ld\n", rx_timestamp - (old + params->dft_sz));
+    if (ret != params->dft_sz)
       printf("read of :%d\n", ret);
     count++;
-    pthread_mutex_lock(&params.txMutex);
+    AssertFatal(!pthread_mutex_lock(&params->txMutex), "");
     tx_timestamp = rx_timestamp;
-    pthread_cond_signal(&tx_trig);
+    AssertFatal(!pthread_cond_signal(&tx_trig), "");
+    AssertFatal(!pthread_mutex_unlock(&params->txMutex), "");
     // LOG_E(HW,"signal: %lu\n", tx_timestamp);
-    pthread_mutex_unlock(&params.txMutex);
+    for (int i = 0; i < params->dft_sz; i++)
+      params->samplesRx[0][i] = (c16_t){params->samplesRx[0][i].r >> 5, params->samplesRx[0][i].i >> 5};
+    AssertFatal(!pthread_mutex_unlock(&params->rxMutex), "");
+    //    dft(get_dft(len), (int16_t *)form->timeDomain, (int16_t *)form->freqDomain, 1);
     struct timespec now;
     clock_gettime(CLOCK_REALTIME, &now);
     if (now.tv_sec != last_second.tv_sec) {
@@ -229,9 +235,12 @@ int main(int argc, char **argv) {
 
   /* scopedata shall be filled from a software FIFO and not directly from the samples */
   threads_t params = (threads_t){&rfdevice, antennas, DFT, samplesRx, samplesTx};
-  pthread_mutex_init(&params.rxMutex, NULL);
-  pthread_mutex_init(&params.txMutex, NULL);
-  pthread_cond_init(&tx_trig, NULL);
+  pthread_mutexattr_t attr;
+  pthread_mutexattr_init(&attr);
+  pthread_mutexattr_settype(&attr, PTHREAD_MUTEX_ERRORCHECK);
+  AssertFatal(!pthread_mutex_init(&params.txMutex, &attr), "");
+  AssertFatal(!pthread_mutex_init(&params.txMutex, &attr), "");
+  AssertFatal(!pthread_cond_init(&tx_trig, NULL), "");
   CalibrationInitScope(&params);
   rfdevice.trx_start_func(&rfdevice);
 
