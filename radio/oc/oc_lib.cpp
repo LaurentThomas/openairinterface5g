@@ -226,6 +226,9 @@ void *write_thread(void *arg)
 {
   oc_state_t *s = (oc_state_t *)arg;
   uint64_t last_rx = s->last_rx->pop();
+  FILE* fd=fopen("/tmp/headers", "w");
+  fprintf(fd,"time before call xdma, nano sec in xdma write, packet seq num, timestamp\n");
+  char * log_headers=getenv("LOGHEADERS");
   do {
     tx_packet_t *p = s->ready_tx->pop();
     if (last_rx + tx_ahead < p->h.timestamp)
@@ -234,13 +237,21 @@ void *write_thread(void *arg)
       last_rx = s->last_rx->pop();
       LOG_D(HW, "pop rx: %lu, rx q sz %lu, tx q sz %lu\n", last_rx, s->last_rx->m_queue.size(), s->ready_tx->m_queue.size());
     }
-
+    struct timespec b,e;
+    clock_gettime(CLOCK_REALTIME,&b);
     size_t wrote = write(s->fd_write, p, sizeof(tx_packet_t) * NB_BLOCKS_PER_WRITE);
+    clock_gettime(CLOCK_REALTIME,&e);
     if (wrote != sizeof(tx_packet_t) * NB_BLOCKS_PER_WRITE)
       LOG_E(HW, "write to SDR failed, request: %lu, wrote %ld\n", sizeof(tx_packet_t) * NB_BLOCKS_PER_WRITE, wrote);
     if (wrote < 0)
       LOG_E(HW, "write to %s failed, errno %d:%s\n", s->filename_write, errno, strerror(errno));
     LOG_D(HW, "wrote: %lu\n", p->h.timestamp);
+    if (log_headers) {
+      char str[60];
+      memset(str,' ', sizeof(str));
+      snprintf(str,sizeof(str), "%lu.%lu, %lu, %u, %lu\n", b.tv_sec, b.tv_nsec,(e.tv_sec-b.tv_sec)*1000*1000*1000+e.tv_nsec-b.tv_nsec,p->h.packetSeqNum,p->h.timestamp);
+      fwrite(str, sizeof(str),1,fd);
+    }
     free(p);
   } while (true);
   return NULL;
@@ -281,7 +292,7 @@ static inline int write_block(oc_state_t *s, c16_t *samples, uint sz)
   tx_packet_t *ant0 = s->tx_block + s->tx_block_pos;
   ant0->h = (headerTx_t){.control = magic_tx,
                          .packetSeqNum = s->txSeq++,
-                         .packetSz = 0x0800,
+                         .packetSz = WRITE_BLOCK_NB_SAMPLES,
                          .seqId = 1,
                          .filler = 0x02,
                          .markers = 0xb1,
@@ -289,12 +300,12 @@ static inline int write_block(oc_state_t *s, c16_t *samples, uint sz)
                          .txGain = 0x112233,
                          .filler3 = 0xf0,
                          .ppsOffset = 0x28272625,
-                         .timestamp = (uint64_t)s->tx_ts-2495};
+                         .timestamp = (uint64_t)s->tx_ts-170};
   for (uint i = 0; i < sz; i++)
     ant0->b[i] = (c16_t){(int16_t)(samples[i].r << 4), (int16_t)(samples[i].i << 4)};
   // memcpy(ant0->b, samples, sz * sizeof(c16_t));
   s->tx_ts += sz;
-  s->tx_block_pos++; 
+  s->tx_block_pos++;
   s->tx_count++;
   if (s->tx_block_pos == NB_BLOCKS_PER_WRITE) {
     s->ready_tx->push(s->tx_block);

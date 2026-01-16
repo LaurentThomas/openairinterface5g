@@ -361,4 +361,7 @@ void lock_memory_to_ram(void)
   int rc = mlockall(MCL_CURRENT | MCL_FUTURE);
   if (rc != 0)
     LOG_W(UTIL, "mlockall() failed: %d, %s\n", errno, strerror(errno));
+  int h=open("/dev/cpu_dma_latency", 0666);
+  int lat=2; // micro second
+  assert(sizeof(lat)==write(h,&lat,sizeof(lat)));
 }
