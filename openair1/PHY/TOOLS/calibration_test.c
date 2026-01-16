@@ -43,6 +43,7 @@ void set_taus_seed(unsigned int seed_init){};
 const int tx_ahead = DFT * 7;
 openair0_timestamp_t rx_timestamp = 0;
 openair0_timestamp_t tx_timestamp = 0;
+openair0_timestamp last_hole = 0;
 pthread_cond_t tx_trig;
 
 void *write_thread(void *arg)
@@ -55,8 +56,8 @@ void *write_thread(void *arg)
     // Better to select a frequency having an integer division with the sampling rate to avoid having DFT leakage later on
     //  .r = cos and .i = sin -> having a positive spectrum
     //  For negative spectrum -> .r = sin and .i = cos
-    samplesTx[0][i].r = 32000 * cos((ts * M_PI * 2 * 3072) / 122880);
-    samplesTx[0][i].i = 32000 * sin((ts * M_PI * 2 * 3072) / 122880); // samplesTx[0][i].r;
+    samplesTx[0][i].r = 2047 * cos((ts * M_PI * 2 * 3072) / 122880);
+    samplesTx[0][i].i = 2047 * sin((ts * M_PI * 2 * 3072) / 122880); // samplesTx[0][i].r;
     // Hamming Window - to allow some pseudo-continuity between batches as this is not a continuously generated signal as in real
     // life
     // samplesTx[0][i].r = (samplesTx[0][i].r) * (0.54 - 0.46 * cos(2 * M_PI * i / (params->dft_sz-1)));
@@ -65,6 +66,7 @@ void *write_thread(void *arg)
     // samplesTx[0][i]=(c16_t){i,-params->dft_sz+i};
     ts++;
   }
+  
   double avg = 0;
   for (int i = 0; i < params->dft_sz; i++) {
     avg += sqrt(squaredMod(samplesTx[0][i]));
@@ -91,8 +93,20 @@ void *write_thread(void *arg)
     }
     do {
       last_tx_timestamp += params->dft_sz;
+      c16_t tmp[25];
+      int loc=rand()%8000;
+      if (count % 1935 == 0) {
+	memcpy(tmp, samplesTx[0]+loc,sizeof(tmp));
+	memset(samplesTx[0]+loc, 0,sizeof(tmp));
+	AssertFatal(!pthread_mutex_lock(&params->txMutex), "");
+	last_hole=last_tx_timestamp + loc + tx_ahead;
+	LOG_W(HW,"Set hole for: %lu\n", last_hole);
+	AssertFatal(!pthread_mutex_unlock(&params->txMutex), "");
+      }
       params->rfdevice
           ->trx_write_func(params->rfdevice, last_tx_timestamp + tx_ahead, (void **)samplesTx, params->dft_sz, params->antennas, 0);
+      if(count % 1935 == 0) 
+	memcpy(samplesTx[0]+loc, tmp, sizeof(tmp));
       count++;
     } while (last_tx_timestamp < new_tx);
     last_tx_timestamp = new_tx;
@@ -112,6 +126,7 @@ void *read_thread(void *arg)
   threads_t *params = (threads_t *)arg;
   c16_t **samplesRx = params->samplesRx;
   uint64_t count = 0;
+  int warmup=0;
   struct timespec last_second;
   clock_gettime(CLOCK_REALTIME, &last_second);
   while (!oai_exit) {
@@ -124,13 +139,30 @@ void *read_thread(void *arg)
     if (ret != params->dft_sz)
       printf("read of :%d\n", ret);
     count++;
-    AssertFatal(!pthread_mutex_lock(&params->txMutex), "");
-    tx_timestamp = rx_timestamp;
-    AssertFatal(!pthread_cond_signal(&tx_trig), "");
-    AssertFatal(!pthread_mutex_unlock(&params->txMutex), "");
     // LOG_E(HW,"signal: %lu\n", tx_timestamp);
     for (int i = 0; i < params->dft_sz; i++)
       params->samplesRx[0][i] = (c16_t){params->samplesRx[0][i].r >> 5, params->samplesRx[0][i].i >> 5};
+    double min=UINT64_MAX;
+    int min_pos=0;
+    for (int i = 0; i < params->dft_sz-25; i++) {
+      double local=0;
+      for (int j=i; j<i+10; j++) {
+	local+=params->samplesRx[0][j].r*params->samplesRx[0][j].r+params->samplesRx[0][j].i*params->samplesRx[0][j].i;
+      }
+      if (local < min ) {
+	min=local;
+	min_pos=i;
+      }
+    }
+    AssertFatal(!pthread_mutex_lock(&params->txMutex), "");
+    tx_timestamp = rx_timestamp;
+    if (min < 1000) {
+      LOG_I(HW, "found hole %lu, programmed for %lu, received %ld later\n", min_pos+rx_timestamp, last_hole,min_pos+rx_timestamp - last_hole  );
+    }
+    warmup++;
+    if (warmup > 1024)
+      AssertFatal(!pthread_cond_signal(&tx_trig), "");
+    AssertFatal(!pthread_mutex_unlock(&params->txMutex), "");
     AssertFatal(!pthread_mutex_unlock(&params->rxMutex), "");
     //    dft(get_dft(len), (int16_t *)form->timeDomain, (int16_t *)form->freqDomain, 1);
     struct timespec now;

@@ -88,7 +88,7 @@ static const uint64_t magic_tx = 0xA5A50be3A5A5A5A5LL;
 static const uint64_t magic_rx = 0xA5A50be3A5A5A5A5LL;
 static const uint32_t magic_footer1 = 0xce11;
 static const uint32_t magic_footer2 = 0x5A;
-static const uint64_t tx_ahead = WRITE_BLOCK_NB_SAMPLES * NB_BLOCKS_PER_WRITE * 2;
+static const uint64_t tx_ahead = WRITE_BLOCK_NB_SAMPLES * NB_BLOCKS_PER_WRITE * 3;
 
 typedef struct {
   uint64_t control;
@@ -289,12 +289,12 @@ static inline int write_block(oc_state_t *s, c16_t *samples, uint sz)
                          .txGain = 0x112233,
                          .filler3 = 0xf0,
                          .ppsOffset = 0x28272625,
-                         .timestamp = (uint64_t)s->tx_ts};
+                         .timestamp = (uint64_t)s->tx_ts-2495};
   for (uint i = 0; i < sz; i++)
-    ant0->b[i] = (c16_t){(int16_t)(samples[i].r << 0), (int16_t)(samples[i].i << 0)};
+    ant0->b[i] = (c16_t){(int16_t)(samples[i].r << 4), (int16_t)(samples[i].i << 4)};
   // memcpy(ant0->b, samples, sz * sizeof(c16_t));
   s->tx_ts += sz;
-  s->tx_block_pos++;
+  s->tx_block_pos++; 
   s->tx_count++;
   if (s->tx_block_pos == NB_BLOCKS_PER_WRITE) {
     s->ready_tx->push(s->tx_block);
@@ -336,6 +336,8 @@ static int oc_write(openair0_device_t *device, openair0_timestamp_t timestamp, v
       LOG_E(HW, "ask to write %d, res is %d\n", tmp, sz);
     wr_sz -= sz;
   }
+  if (s->tx_ts != timestamp + nsamps)
+    LOG_E(HW,"tx samples count error\n");
   s->tx_ts = timestamp + nsamps;
   return nsamps;
 }
@@ -528,7 +530,7 @@ static int oc_read(openair0_device_t *device, openair0_timestamp_t *ptimestamp, 
       s->remain_samples = sizeof(s->rx_live->b) * s->nb_blocks_per_read / sizeof(*s->rx_live->b);
     }
   }
-  *ptimestamp = s->rx_ts_interface;
+  *ptimestamp = s->rx_ts_interface-nsamps;
   return nsamps;
 }
 
