@@ -46,27 +46,46 @@ openair0_timestamp_t tx_timestamp = 0;
 openair0_timestamp last_hole = 0;
 pthread_cond_t tx_trig;
 
+#define GEN_CHIRP
+#define WAVE_AMP   (2047.0)
+
 void *write_thread(void *arg)
 {
   threads_t *params = (threads_t *)arg;
   c16_t **samplesTx = params->samplesTx;
   uint64_t ts = 0;
+
+
+#if defined GEN_CHIRP
+  double Fs = 122880.0;
+  double f0 =  -40000.0;   // start freq
+  double f1 =   40000.0;  // end freq
+  double T  = params->dft_sz / Fs;
+  double k  = (f1 - f0) / T; // Hz/s sweep rate
+
   for (int i = 0; i < params->dft_sz; i++) {
-#if 1
+    double t = ts / Fs;
+    double phase = 2 * M_PI * (f0 * t + 0.5 * k * t * t);
+    samplesTx[0][i].r = WAVE_AMP * cos(phase);
+    samplesTx[0][i].i = WAVE_AMP * sin(phase);
+    ts++;
+  }
+#else
+  for (int i = 0; i < params->dft_sz; i++) {
     // Better to select a frequency having an integer division with the sampling rate to avoid having DFT leakage later on
     //  .r = cos and .i = sin -> having a positive spectrum
     //  For negative spectrum -> .r = sin and .i = cos
-    samplesTx[0][i].r = 2047 * cos((ts * M_PI * 2 * 3072) / 122880);
-    samplesTx[0][i].i = 2047 * sin((ts * M_PI * 2 * 3072) / 122880); // samplesTx[0][i].r;
+    samplesTx[0][i].r = WAVE_AMP * cos((ts * M_PI * 2 * 3840) / 122880);
+    samplesTx[0][i].i = WAVE_AMP * sin((ts * M_PI * 2 * 3840) / 122880); // samplesTx[0][i].r;
     // Hamming Window - to allow some pseudo-continuity between batches as this is not a continuously generated signal as in real
     // life
     // samplesTx[0][i].r = (samplesTx[0][i].r) * (0.54 - 0.46 * cos(2 * M_PI * i / (params->dft_sz-1)));
     // samplesTx[0][i].i = (samplesTx[0][i].i) * (0.54 - 0.46 * cos(2 * M_PI * i / (params->dft_sz-1)));
-#endif
     // samplesTx[0][i]=(c16_t){i,-params->dft_sz+i};
     ts++;
   }
-  
+#endif
+
   double avg = 0;
   for (int i = 0; i < params->dft_sz; i++) {
     avg += sqrt(squaredMod(samplesTx[0][i]));
@@ -77,6 +96,7 @@ void *write_thread(void *arg)
   clock_gettime(CLOCK_REALTIME, &last_second);
 
   openair0_timestamp_t last_tx_timestamp = 0, new_tx = 0;
+  char * flag=getenv("HOLE");
 
   while (!oai_exit) {
     do {
@@ -95,7 +115,7 @@ void *write_thread(void *arg)
       last_tx_timestamp += params->dft_sz;
       c16_t tmp[25];
       int loc=rand()%8000;
-      if (count % 1935 == 0) {
+      if (flag && count % 1935 == 0) {
 	memcpy(tmp, samplesTx[0]+loc,sizeof(tmp));
 	memset(samplesTx[0]+loc, 0,sizeof(tmp));
 	AssertFatal(!pthread_mutex_lock(&params->txMutex), "");
@@ -105,7 +125,7 @@ void *write_thread(void *arg)
       }
       params->rfdevice
           ->trx_write_func(params->rfdevice, last_tx_timestamp + tx_ahead, (void **)samplesTx, params->dft_sz, params->antennas, 0);
-      if(count % 1935 == 0) 
+      if(flag && count % 1935 == 0)
 	memcpy(samplesTx[0]+loc, tmp, sizeof(tmp));
       count++;
     } while (last_tx_timestamp < new_tx);
@@ -144,14 +164,16 @@ void *read_thread(void *arg)
       params->samplesRx[0][i] = (c16_t){params->samplesRx[0][i].r >> 5, params->samplesRx[0][i].i >> 5};
     double min=UINT64_MAX;
     int min_pos=0;
-    for (int i = 0; i < params->dft_sz-25; i++) {
-      double local=0;
-      for (int j=i; j<i+10; j++) {
-	local+=params->samplesRx[0][j].r*params->samplesRx[0][j].r+params->samplesRx[0][j].i*params->samplesRx[0][j].i;
-      }
-      if (local < min ) {
-	min=local;
-	min_pos=i;
+    if (getenv("HOLE")) {
+      for (int i = 0; i < params->dft_sz-25; i++) {
+	double local=0;
+	for (int j=i; j<i+10; j++) {
+	  local+=params->samplesRx[0][j].r*params->samplesRx[0][j].r+params->samplesRx[0][j].i*params->samplesRx[0][j].i;
+	}
+	if (local < min ) {
+	  min=local;
+	  min_pos=i;
+	}
       }
     }
     AssertFatal(!pthread_mutex_lock(&params->txMutex), "");
@@ -213,7 +235,7 @@ int main(int argc, char **argv) {
   int lat=2; // micro second
   assert(sizeof(lat)==write(h,&lat,sizeof(lat)));
 
-  int sampling_rate = 30.72e6 * 4;
+  int sampling_rate = 30.72e6 * 6;
 
   int antennas = 1;
   uint64_t freq = 3750LLU * 1000 * 1000;
@@ -222,26 +244,27 @@ int main(int argc, char **argv) {
   int filterBand = 40e6;
 
   openair0_config_t openair0_cfg = {
-    .duplex_mode = 0,
-    .sample_rate = sampling_rate,
-    .tx_sample_advance = 0,
-    .rx_num_channels = antennas,
-    .tx_num_channels = antennas,
-    .rx_freq = {freq, freq, freq, freq},
-    .tx_freq = {freq, freq, freq, freq},
-    .rx_gain_calib_table = NULL,
-    .rx_gain = {rxGain, rxGain, rxGain, rxGain},
-    .tx_gain = {txGain, txGain, txGain, txGain},
-    .rx_bw = filterBand,
-    .tx_bw = filterBand,
-    .clock_source = internal, // internal gpsdo external
-    .time_source = internal, // internal gpsdo external
-    .autocal = {0},
-    //! rf devices work with x bits iqs when oai have its own iq format
-    //! the two following parameters are used to convert iqs
-    .configFilename = "",
-    .recplay_mode = 0,
-    .recplay_conf = NULL,
+      .duplex_mode = 0,
+      .sample_rate = sampling_rate,
+      .tx_sample_advance = 0,
+      .rx_num_channels = antennas,
+      .tx_num_channels = antennas,
+      .rx_freq = {freq, freq, freq, freq},
+      .tx_freq = {freq, freq, freq, freq},
+      .rx_gain_calib_table = NULL,
+      .rx_gain = {rxGain, rxGain, rxGain, rxGain},
+      .tx_gain = {txGain, txGain, txGain, txGain},
+      .rx_bw = filterBand,
+      .tx_bw = filterBand,
+      .clock_source = internal, // internal gpsdo external
+      .time_source = internal, // internal gpsdo external
+      .sdr_addrs="addr=192.168.30.2",
+      .autocal = {0},
+      //! rf devices work with x bits iqs when oai have its own iq format
+      //! the two following parameters are used to convert iqs
+      .configFilename = "",
+      .recplay_mode = 0,
+      .recplay_conf = NULL,
   };
   //-----------------------
   
