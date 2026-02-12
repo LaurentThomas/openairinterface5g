@@ -406,7 +406,6 @@ static void nr_rrc_configure_default_SI(NR_UE_RRC_SI_INFO *SI_info,
       NR_SchedulingInfo_t *schedulingInfo = si_SchedulingInfo->schedulingInfoList.list.array[i];
       for (int j = 0; j < schedulingInfo->sib_MappingInfo.list.count; j++) {
         NR_SIB_TypeInfo_t *sib_Type = schedulingInfo->sib_MappingInfo.list.array[j];
-	LOG_W(PHY,"SIB1 tells us we have SIB%ld\n", sib_Type->type+2);
         SI_info->default_otherSI_map[i] |= 1 << sib_Type->type;
       }
     }
@@ -2024,11 +2023,15 @@ static void nr_rrc_ue_decode_NR_BCCH_BCH_Message(NR_UE_RRC_INST_t *rrc,
     RRCLOG_E("NR_BCCH_BCH decode error\n");
     return;
   }
-  static time_t t = 0;
-  time_t t2 = time(0);
-  if (LOG_DEBUGFLAG(DEBUG_ASN1) && t != t2)
-    xer_fprint(stdout, &asn_DEF_NR_BCCH_BCH_Message, (void *)bcch_message);
-  t = t2;
+
+  if (LOG_DEBUGFLAG(DEBUG_ASN1)) {
+    static time_t t = 0;
+    time_t t2 = time(0);
+    if (t != t2) {
+      xer_fprint(stdout, &asn_DEF_NR_BCCH_BCH_Message, (void *)bcch_message);
+      t = t2;
+    }
+  }
   // Actions following cell selection while T311 is running
   NR_UE_Timers_Constants_t *timers = &rrc->timers_and_constants;
   if (nr_timer_is_active(&timers->T311)) {

@@ -380,15 +380,8 @@ static void nr_rx_pdcch_symbol(PHY_VARS_NR_UE *ue,
   if (fp->nb_antennas_rx > 1) {
     nr_pdcch_detection_mrc(fp->nb_antennas_rx, rx_comp_sz, rxdataF_comp);
   }
-  int avg_util = 0;
-  for (int i = 0; i < llr_size_symbol; i++)
-    avg_util += squaredMod(rxdataF_comp[0][i]);
-  // LOG_E(PHY,"avg: %d\n", avg_util);
+  UEscopeCopy(ue, pdcchRxdataF_comp, rxdataF_comp[0], sizeof(c16_t), 1, llr_size_symbol, 0);
   nr_pdcch_llr(llr_size_symbol, rxdataF_comp[0], llr);
-  if (avg_util > 100000) {
-    UEscopeCopy(ue, pdcchRxdataF_comp, rxdataF_comp[0], sizeof(c16_t), 1, llr_size_symbol, 0);
-    UEscopeCopy(ue, pdcchLlr, llr, sizeof(c16_t), 1, llr_size_symbol, 0);
-  }
 }
 
 static bool is_start_symbol_in_ss(const fapi_nr_dl_config_dci_dl_pdu_rel15_t *ss, const int symbol, const int nb_symb_slot)

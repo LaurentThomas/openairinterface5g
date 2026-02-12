@@ -88,7 +88,7 @@ static const uint64_t magic_tx = 0xA5A50be3A5A5A5A5LL;
 static const uint64_t magic_rx = 0xA5A50be3A5A5A5A5LL;
 static const uint32_t magic_footer1 = 0xce11;
 static const uint32_t magic_footer2 = 0x5A;
-static const uint64_t tx_ahead = WRITE_BLOCK_NB_SAMPLES * NB_BLOCKS_PER_WRITE * 3;
+static const uint64_t tx_ahead = WRITE_BLOCK_NB_SAMPLES * 24;
 
 typedef struct {
   uint64_t control;
@@ -187,6 +187,7 @@ typedef struct {
   openair0_timestamp_t rx_timestamp;
   openair0_timestamp_t rx_ts_interface;
   openair0_timestamp_t tx_ts;
+  uint txSeq;
   uint64_t gap;
   tx_packet_t *tx_block;
   size_t tx_block_pos;
@@ -257,7 +258,29 @@ void *write_thread(void *arg)
   return NULL;
 }
 
-static int32_t signalEnergy(int32_t *input, uint32_t length)
+struct energy_s {
+  float mean;
+  float papr_dB;
+  float peak;
+};
+
+struct energy_s compute_papr_db(const c16_t *x, size_t N)
+{
+  float p_max = 0.0f;
+  float p_sum = 0.0f;
+
+  for (size_t n = 0; n < N; n++) {
+    float p = (float)x[n].r * x[n].r + (float)x[n].i * x[n].i;
+    p_sum += p;
+    if (p > p_max)
+      p_max = p;
+  }
+  float p_avg = p_sum / N;
+  float papr = p_max / p_avg;
+  return (struct energy_s){p_avg, 10.0f * log10f(papr), sqrt(p_max)};
+}
+
+static int32_t signalEnergy(c16_t *input, uint32_t length)
 {
   // init
   simde__m128 mm0 = simde_mm_setzero_ps();
@@ -271,8 +294,8 @@ static int32_t signalEnergy(int32_t *input, uint32_t length)
 
   // leftover
   float leftover_sum = 0;
-  c16_t *leftover_input = (c16_t *)input;
-  uint16_t lefover_count = length - ((length >> 2) << 2);
+  c16_t *leftover_input = input + (length & ~3);
+  uint16_t lefover_count = length & 3;
   for (int32_t i = 0; i < lefover_count; i++) {
     leftover_sum += leftover_input[i].r * leftover_input[i].r + leftover_input[i].i * leftover_input[i].i;
   }
@@ -350,6 +373,16 @@ static int oc_write(openair0_device_t *device, openair0_timestamp_t timestamp, v
   if (s->tx_ts != timestamp + nsamps)
     LOG_E(HW,"tx samples count error\n");
   s->tx_ts = timestamp + nsamps;
+  #if 0
+  static uint nsamps0 = 0;
+  struct energy_s e = compute_papr_db((c16_t *)*buff, nsamps);
+  if (e.mean > 1) {
+    LOG_I(HW, "sent power: %f, papr %f, max %f after %d samples with no energy\n", e.mean, e.papr_dB, e.peak, nsamps0);
+    nsamps0 = 0;
+  } else {
+    nsamps0 += nsamps;
+  }
+  #endif
   return nsamps;
 }
 
@@ -492,6 +525,31 @@ static bool get_blocks(oc_state_t *s, rx_packet_t *p)
   s->last_rx->push(s->rx_timestamp);
   LOG_D(HW, "read: %lu\n", s->rx_timestamp);
   return true;
+}
+
+void *read_thread(void *arg)
+{
+  oc_state_t *s = (oc_state_t *)arg;
+  while (true) {
+    if (s->rx_count == -1)
+      initial_block_align(s);
+    if (s->rx_count == -1) {
+      usleep(10);
+      continue;
+    }
+    if (s->read_queue->m_queue.size() > 100) {
+      LOG_W(HW, "rx consumer is too slow, trashing rx queue\n");
+      while (s->read_queue->m_queue.size())
+        free(s->read_queue->pop());
+    }
+    rx_packet_t *tmp = (rx_packet_t *)malloc(sizeof(*s->rx_live) * s->nb_blocks_per_read);
+    if (!get_blocks(s, tmp)) {
+      printf("getblocks returned bad\n");
+      free(tmp);
+    } else
+      s->read_queue->push(tmp);
+  }
+  return NULL;
 }
 
 static int oc_read(openair0_device_t *device, openair0_timestamp_t *ptimestamp, void **buff, int nsamps, int cc)
