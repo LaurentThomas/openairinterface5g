@@ -40,10 +40,10 @@ void nfapi_setmode(nfapi_mode_t nfapi_mode) {}
 void set_taus_seed(unsigned int seed_init){};
 
 // configmodule_interface_t *uniqCfg = NULL;
-const int tx_ahead = DFT * 7;
+const int tx_ahead = DFT * 20;
 openair0_timestamp_t rx_timestamp = 0;
 openair0_timestamp_t tx_timestamp = 0;
-openair0_timestamp last_hole = 0;
+openair0_timestamp_t last_hole = 0;
 pthread_cond_t tx_trig;
 
 #define GEN_CHIRP
@@ -96,8 +96,7 @@ void *write_thread(void *arg)
   clock_gettime(CLOCK_REALTIME, &last_second);
 
   openair0_timestamp_t last_tx_timestamp = 0, new_tx = 0;
-  char * flag=getenv("HOLE");
-
+  char *flag = getenv("HOLE");
   while (!oai_exit) {
     do {
       AssertFatal(!pthread_mutex_lock(&params->txMutex), "");
