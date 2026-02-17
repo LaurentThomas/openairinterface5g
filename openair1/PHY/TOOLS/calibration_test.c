@@ -40,51 +40,48 @@ void nfapi_setmode(nfapi_mode_t nfapi_mode) {}
 void set_taus_seed(unsigned int seed_init){};
 
 // configmodule_interface_t *uniqCfg = NULL;
-const int tx_ahead = DFT * 20;
 openair0_timestamp_t rx_timestamp = 0;
 openair0_timestamp_t tx_timestamp = 0;
 openair0_timestamp_t last_hole = 0;
 pthread_cond_t tx_trig;
-
-#define GEN_CHIRP
-#define WAVE_AMP   (2047.0)
 
 void *write_thread(void *arg)
 {
   threads_t *params = (threads_t *)arg;
   c16_t **samplesTx = params->samplesTx;
   uint64_t ts = 0;
+  const float WAVE_AMP = params->c->amplitude;
+  const float sin_freq = params->c->sinus_freq;
 
-
-#if defined GEN_CHIRP
-  double Fs = 122880.0;
-  double f0 =  -40000.0;   // start freq
-  double f1 =   40000.0;  // end freq
-  double T  = params->dft_sz / Fs;
-  double k  = (f1 - f0) / T; // Hz/s sweep rate
-
-  for (int i = 0; i < params->dft_sz; i++) {
-    double t = ts / Fs;
-    double phase = 2 * M_PI * (f0 * t + 0.5 * k * t * t);
-    samplesTx[0][i].r = WAVE_AMP * cos(phase);
-    samplesTx[0][i].i = WAVE_AMP * sin(phase);
-    ts++;
+  if (params->c->chirp) {
+    double Fs = 122880.0;
+    double f0 =  -40000.0;   // start freq
+    double f1 =   40000.0;  // end freq
+    double T  = params->dft_sz / Fs;
+    double k  = (f1 - f0) / T; // Hz/s sweep rate
+    
+    for (int i = 0; i < params->dft_sz; i++) {
+      double t = ts / Fs;
+      double phase = 2 * M_PI * (f0 * t + 0.5 * k * t * t);
+      samplesTx[0][i].r = WAVE_AMP * cos(phase);
+      samplesTx[0][i].i = WAVE_AMP * sin(phase);
+      ts++;
+    }
+  } else {
+    for (int i = 0; i < params->dft_sz; i++) {
+      // Better to select a frequency having an integer division with the sampling rate to avoid having DFT leakage later on
+      //  .r = cos and .i = sin -> having a positive spectrum
+      //  For negative spectrum -> .r = sin and .i = cos
+      samplesTx[0][i].r = WAVE_AMP * cos((ts * M_PI * 2 * sin_freq) / 122880000);
+      samplesTx[0][i].i = WAVE_AMP * sin((ts * M_PI * 2 * sin_freq) / 122880000); // samplesTx[0][i].r;
+      // Hamming Window - to allow some pseudo-continuity between batches as this is not a continuously generated signal as in real
+      // life
+      // samplesTx[0][i].r = (samplesTx[0][i].r) * (0.54 - 0.46 * cos(2 * M_PI * i / (params->dft_sz-1)));
+      // samplesTx[0][i].i = (samplesTx[0][i].i) * (0.54 - 0.46 * cos(2 * M_PI * i / (params->dft_sz-1)));
+      // samplesTx[0][i]=(c16_t){i,-params->dft_sz+i};
+      ts++;
+    }
   }
-#else
-  for (int i = 0; i < params->dft_sz; i++) {
-    // Better to select a frequency having an integer division with the sampling rate to avoid having DFT leakage later on
-    //  .r = cos and .i = sin -> having a positive spectrum
-    //  For negative spectrum -> .r = sin and .i = cos
-    samplesTx[0][i].r = WAVE_AMP * cos((ts * M_PI * 2 * 3840) / 122880);
-    samplesTx[0][i].i = WAVE_AMP * sin((ts * M_PI * 2 * 3840) / 122880); // samplesTx[0][i].r;
-    // Hamming Window - to allow some pseudo-continuity between batches as this is not a continuously generated signal as in real
-    // life
-    // samplesTx[0][i].r = (samplesTx[0][i].r) * (0.54 - 0.46 * cos(2 * M_PI * i / (params->dft_sz-1)));
-    // samplesTx[0][i].i = (samplesTx[0][i].i) * (0.54 - 0.46 * cos(2 * M_PI * i / (params->dft_sz-1)));
-    // samplesTx[0][i]=(c16_t){i,-params->dft_sz+i};
-    ts++;
-  }
-#endif
 
   double avg = 0;
   for (int i = 0; i < params->dft_sz; i++) {
@@ -96,6 +93,8 @@ void *write_thread(void *arg)
   clock_gettime(CLOCK_REALTIME, &last_second);
 
   openair0_timestamp_t last_tx_timestamp = 0, new_tx = 0;
+  // this is tx ahead in main application, the driver has it's tx ahead that shuld be smaller to prevent starvation
+  const int tx_ahead =  params->dft_sz * 20;
   char *flag = getenv("HOLE");
   while (!oai_exit) {
     do {
@@ -104,7 +103,7 @@ void *write_thread(void *arg)
       new_tx = tx_timestamp & ~31;
       AssertFatal(!pthread_mutex_unlock(&params->txMutex), "");
     } while (last_tx_timestamp == new_tx);
-    if (last_tx_timestamp + 8192 != new_tx)
+    if (last_tx_timestamp +  params->dft_sz != new_tx)
       LOG_D(HW, "not continuous %ld\n", new_tx - (last_tx_timestamp + params->dft_sz));
     if (abs(last_tx_timestamp - new_tx) > 1228800) {
       LOG_W(HW, "large tx gap %ld\n", new_tx - (last_tx_timestamp + params->dft_sz));
@@ -149,18 +148,23 @@ void *read_thread(void *arg)
   struct timespec last_second;
   clock_gettime(CLOCK_REALTIME, &last_second);
   while (!oai_exit) {
-    AssertFatal(!pthread_mutex_lock(&params->rxMutex), "");
     uint64_t old = rx_timestamp;
+     __attribute__((aligned(32))) c16_t rx[ params->dft_sz ];
+     c16_t *rxptr=rx;
     int ret =
-        params->rfdevice->trx_read_func(params->rfdevice, &rx_timestamp, (void **)samplesRx, params->dft_sz, params->antennas);
+        params->rfdevice->trx_read_func(params->rfdevice, &rx_timestamp, (void **)&rxptr, params->dft_sz, params->antennas);
     if (old + params->dft_sz != rx_timestamp)
       LOG_E(HW, "not continuous rx %ld\n", rx_timestamp - (old + params->dft_sz));
     if (ret != params->dft_sz)
       printf("read of :%d\n", ret);
     count++;
+    AssertFatal(!pthread_mutex_lock(&params->rxMutex), "");
+    memcpy(samplesRx[0],rx, sizeof(rx));
     // LOG_E(HW,"signal: %lu\n", tx_timestamp);
+    /*
     for (int i = 0; i < params->dft_sz; i++)
-      params->samplesRx[0][i] = (c16_t){params->samplesRx[0][i].r >> 5, params->samplesRx[0][i].i >> 5};
+      params->samplesRx[0][i] = (c16_t){params->samplesRx[0][i].r >>2, params->samplesRx[0][i].i >>2};
+    */
     double min=UINT64_MAX;
     int min_pos=0;
     if (getenv("HOLE")) {
@@ -223,13 +227,24 @@ int main(int argc, char **argv) {
   setvbuf(stderr, NULL, _IONBF, 0);
   logInit();
 
-  paramdef_t cmdline_params[] = CMDLINE_PARAMS_DESC_GNB;
-
   CONFIG_SETRTFLAG(CONFIG_NOEXITONHELP);
   get_common_options(uniqCfg);
-  CONFIG_CLEARRTFLAG(CONFIG_NOEXITONHELP);
-  lock_memory_to_ram();
 
+  config_t c = {1, 1, 3750000, 1, 2047, 10000, 8192};
+  paramdef_t cmdline_params[] = {
+      {"tx", "enable tx", 0, .uptr = &c.tx, .defintval = 1, TYPE_UINT, 0},
+      {"rx", "enable tx", 0, .uptr = &c.rx, .defintval = 1, TYPE_UINT, 0},
+      {"freq", "center frequency in kHz", 0, .uptr = &c.freq, .defintval = 1, TYPE_UINT, 0},
+      {"chirp", "generate signal for full I/Q (circle), constant amplitude",
+       0, .uptr = &c.chirp,.defintval = 1, TYPE_UINT, 0},
+      {"amplitude", "signal amplitude (int16)", 0, .uptr = &c.amplitude, .defintval = 2047, TYPE_UINT, 0},
+      {"sinus_freq", "if chirp is false, sinut frequency in KHz", .uptr=&c.sinus_freq, .defintval = 10000, TYPE_UINT, 0},
+      {"dft", "dft size for signal frequency/time convertion",  .uptr = &c.dft, .defintval = 8192, TYPE_UINT, 0},
+  };
+  config_process_cmdline(uniqCfg, cmdline_params, sizeofArray(cmdline_params), NULL);
+  CONFIG_CLEARRTFLAG(CONFIG_NOEXITONHELP);
+  
+  lock_memory_to_ram();
   int h=open("/dev/cpu_dma_latency", 0666);
   int lat=2; // micro second
   assert(sizeof(lat)==write(h,&lat,sizeof(lat)));
@@ -237,7 +252,7 @@ int main(int argc, char **argv) {
   int sampling_rate = 30.72e6 * 6;
 
   int antennas = 1;
-  uint64_t freq = 3750LLU * 1000 * 1000;
+  uint64_t freq = c.freq * 1000;
   int rxGain = 90;
   int txGain = 0;
   int filterBand = 40e6;
@@ -255,7 +270,7 @@ int main(int argc, char **argv) {
       .tx_gain = {txGain, txGain, txGain, txGain},
       .rx_bw = filterBand,
       .tx_bw = filterBand,
-      .clock_source = internal, // internal gpsdo external
+      .clock_source = external, // internal gpsdo external
       .time_source = internal, // internal gpsdo external
       .sdr_addrs="addr=192.168.30.2",
       .autocal = {0},
@@ -280,15 +295,15 @@ int main(int argc, char **argv) {
 
   c16_t **samplesRx = malloc16(antennas * sizeof(c16_t *));
   for (int i = 0; i < antennas; i++) {
-    samplesRx[i] = malloc16_clear(DFT * sizeof(c16_t));
+    samplesRx[i] = malloc16_clear(c.dft * sizeof(c16_t));
   }
   c16_t **samplesTx = malloc16(antennas * sizeof(c16_t *));
   for (int i = 0; i < antennas; i++) {
-    samplesTx[i] = malloc16_clear(DFT * sizeof(c16_t));
+    samplesTx[i] = malloc16_clear(c.dft * sizeof(c16_t));
   }
 
   /* scopedata shall be filled from a software FIFO and not directly from the samples */
-  threads_t params = (threads_t){&rfdevice, antennas, DFT, samplesRx, samplesTx};
+  threads_t params = (threads_t){&c, &rfdevice, antennas, c.dft, samplesRx, samplesTx};
   pthread_mutexattr_t attr;
   pthread_mutexattr_init(&attr);
   pthread_mutexattr_settype(&attr, PTHREAD_MUTEX_ERRORCHECK);
@@ -299,9 +314,11 @@ int main(int argc, char **argv) {
   rfdevice.trx_start_func(&rfdevice);
 
   pthread_t w_thread;
-  threadCreate(&w_thread, write_thread, &params, "write_thr", 3, OAI_PRIORITY_RT);
+  if (c.tx)
+    threadCreate(&w_thread, write_thread, &params, "write_thr", 3, OAI_PRIORITY_RT);
   pthread_t r_thread;
-  threadCreate(&r_thread, read_thread, &params, "read_thr", 2, OAI_PRIORITY_RT);
+  if (c.rx)
+    threadCreate(&r_thread, read_thread, &params, "read_thr", 2, OAI_PRIORITY_RT);
   (void)pthread_join(w_thread, NULL);
   (void)pthread_join(r_thread, NULL);
 

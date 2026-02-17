@@ -176,14 +176,12 @@ static void oai_xygraph(OAIgraph_t *graph, float *x, float *y, int len, int laye
 
   if ( NoAutoScale && graph->iteration%NoAutoScale == 0) {
     float maxX=0, maxY=0, minX=0, minY=0;
-
     for (int k=0; k<len; k++) {
       maxX=max(maxX,x[k]);
       minX=min(minX,x[k]);
       maxY=max(maxY,y[k]);
       minY=min(minY,y[k]);
     }
-
     setRange(graph, minX-5, maxX+5, minY-5, maxY+5);
   }
 
@@ -268,7 +266,7 @@ static void genericPowerPerAntena(OAIgraph_t  *graph, const int nb_ant, const sc
 static void gNBWaterFall(OAIgraph_t *graph, OAI_phy_scope_t *scope)
 {
   //use 1st antenna
-  genericWaterFall(graph, scope->timeDomain, DFT, 10, "X axis:one frame in time");
+  genericWaterFall(graph, scope->timeDomain,  scope->context->dft_sz, 10, "X axis:one frame in time");
 }
 
 static void spectrum(OAIgraph_t *graph, OAI_phy_scope_t *scope)
@@ -293,7 +291,7 @@ static void zoomIn(OAIgraph_t *graph,  OAI_phy_scope_t *scope)
     return;
   t = n;
   int len = scope->context->dft_sz;
-  int detailLen = min(len, 600);
+  int detailLen = min(len, 750);
   int beg=max(0, rand()%len - detailLen )/2*2;
   for (int ri = 0; ri < 2; ri++) {
     float *values;
@@ -339,7 +337,7 @@ static void signalIQ(OAIgraph_t *graph,OAI_phy_scope_t *scope)
     Q[k] = scope->freqDomain[k].i;
   }
 
-  oai_xygraph(graph, I, Q, DFT, 0, 10);
+  oai_xygraph(graph, I, Q,  scope->context->dft_sz, 0, 10);
 }
 static void signalIQtx(OAIgraph_t *graph,OAI_phy_scope_t *scope)
 {
@@ -352,7 +350,7 @@ static void signalIQtx(OAIgraph_t *graph,OAI_phy_scope_t *scope)
     Q[k] = scope->freqDomainTx[k].i;
   }
 
-  oai_xygraph(graph, I, Q, DFT, 0, 10);
+  oai_xygraph(graph, I, Q, scope->context->dft_sz, 0, 10);
 }
 
 static OAI_phy_scope_t *createScopeCalibration(threads_t *context)
@@ -366,29 +364,28 @@ static OAI_phy_scope_t *createScopeCalibration(threads_t *context)
   obj = fl_add_box( FL_BORDER_BOX, 0, 0, 800, 800, "" );
   fl_set_object_color( obj, FL_BLACK, FL_WHITE );
   int curY=0,x,y,w,h;
+  
   OAIgraph_t *graph = fdui->graph;
   // Received signal
-  *graph++ = calibrationCommonGraph(zoomIn, FL_NORMAL_XYPLOT, 0, curY, 400, 100, "Received Signal in time zoom", FL_RED);
-
-  // Time-domain channel response
-  // fdui->graph[1] = calibrationCommonGraph( timeResponse, FL_NORMAL_XYPLOT, 410, curY, 400, 100, "SRS Frequency Response (samples,
-  // abs)", FL_RED );
-  // frequency spectrum
-  *graph++ = calibrationCommonGraph(spectrum, FL_NORMAL_XYPLOT, 410, curY, 400, 100, "DFT output", FL_YELLOW);
+  *graph++ = calibrationCommonGraph(zoomIn, FL_NORMAL_XYPLOT, 0, curY, 800, 100, "Received Signal in time zoom", FL_RED);
   fl_get_object_bbox(fdui->graph[0].graph,&x, &y,&w, &h);
+   curY += h + 20;
+  // frequency spectrum
+  *graph++ = calibrationCommonGraph(spectrum, FL_NORMAL_XYPLOT, 0, curY, 800, 100, "DFT output", FL_YELLOW);
+  fl_get_object_bbox(fdui->graph[1].graph,&x, &y,&w, &h);
   curY += h + 20;
-
   // Frequency-domain channel response
   *graph++ = calibrationCommonGraph(gNBWaterFall, WATERFALL, 0, curY, 800, 100, "received signal in time", FL_RED);
   fl_get_object_bbox(fdui->graph[2].graph, &x, &y, &w, &h);
   curY+=h+20;
-  *graph++ = calibrationCommonGraph(signalIQtx, FL_POINTS_XYPLOT, 0, curY, 300, 300, "Tx generated I/Q of frequency domain", FL_YELLOW);
-  fl_get_object_bbox(fdui->graph[2].graph,&x, &y,&w, &h);
+  *graph++ = calibrationCommonGraph(signalIQ, FL_POINTS_XYPLOT, 0, curY, 300, 300, "I/Q of frequency domain", FL_YELLOW);
+  *graph++ = calibrationCommonGraph(signalIQtx, FL_POINTS_XYPLOT, 500, curY, 300, 300, "Tx generated I/Q of frequency domain", FL_YELLOW);
+  fl_get_object_bbox(fdui->graph[3].graph,&x, &y,&w, &h);
   // LLR of PUSCH
   //fdui->graph[3] = calibrationCommonGraph( puschLLR, FL_POINTS_XYPLOT, 0, curY, 500, 200, "PUSCH Log-Likelihood Ratios (LLR, mag)", FL_YELLOW );
   // I/Q PUSCH comp
-  *graph++ = calibrationCommonGraph(signalIQ, FL_POINTS_XYPLOT, 500, curY, 300, 300, "I/Q of frequency domain", FL_YELLOW);
-  fl_get_object_bbox(fdui->graph[2].graph,&x, &y,&w, &h);
+  //curY+=h+20;
+  fl_get_object_bbox(fdui->graph[4].graph,&x, &y,&w, &h);
   curY+=h;
   //fl_get_object_bbox(fdui->graph[6].graph,&x, &y,&w, &h);
   curY += h;
@@ -412,7 +409,7 @@ void calibrationScope(OAI_phy_scope_t  *form) {
   memcpy(form->timeDomain, form->context->samplesRx[0], len * sizeof(*form->timeDomain));
   memcpy(form->timeDomainTx, form->context->samplesTx[0], len * sizeof(*form->timeDomainTx));
   pthread_mutex_unlock(&form->context->rxMutex);
-  dft(get_dft(len), (int16_t *)form->timeDomain, (int16_t *)form->freqDomain, 1);
+  dft(get_dft(len), (int16_t *)form->timeDomain, (int16_t *)form->freqDomain, 1);		     
   dft(get_dft(len), (int16_t *)form->timeDomainTx, (int16_t *)form->freqDomainTx, 1);
 
   int i = 0;
@@ -420,7 +417,6 @@ void calibrationScope(OAI_phy_scope_t  *form) {
     form->graph[i].funct(form->graph + i, form);
     i++;
   }
-
   //fl_check_forms();
 }
 
