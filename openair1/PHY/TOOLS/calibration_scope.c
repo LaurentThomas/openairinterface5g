@@ -171,9 +171,8 @@ static void oai_xygraph_getbuff(OAIgraph_t *graph, float **x, float **y, int len
   *y=old_y;
 }
 
-static void oai_xygraph(OAIgraph_t *graph, float *x, float *y, int len, int layer, bool NoAutoScale) {
+static void oai_xygraph(OAIgraph_t *graph, float *x, float *y, int len, int layer, int NoAutoScale) {
   fl_redraw_object(graph->graph);
-
   if ( NoAutoScale && graph->iteration%NoAutoScale == 0) {
     float maxX=0, maxY=0, minX=0, minY=0;
     for (int k=0; k<len; k++) {
@@ -257,8 +256,7 @@ static void genericPowerPerAntena(OAIgraph_t  *graph, const int nb_ant, const sc
       for (int i=0; i<len; i++) {
         values[i] = SquaredNorm(data[ant][i]);
       }
-
-      oai_xygraph(graph,time,values, len, ant, 10);
+      oai_xygraph(graph,time,values, len, ant, 1000);
     }
   }
 }
@@ -279,7 +277,7 @@ static void spectrum(OAIgraph_t *graph, OAI_phy_scope_t *scope)
     for (int i = 0; i < len; i++) {
       values[i] = ri ? scope->freqDomain[(i + len / 2) % len].i : scope->freqDomain[(i + len / 2) % len].r;
     }
-    oai_xygraph(graph, time, values, len, ri, 1);
+    oai_xygraph(graph, time, values, len, ri, 100);
   }
 }
 
@@ -299,7 +297,7 @@ static void zoomIn(OAIgraph_t *graph,  OAI_phy_scope_t *scope)
     oai_xygraph_getbuff(graph, &time, &values, detailLen, ri);
     for (int i = 0; i < detailLen; i++)
       values[i] = ri ? scope->timeDomain[beg+i].i : scope->timeDomain[beg+i].r;
-    oai_xygraph(graph, time, values, detailLen, ri, 1);
+    oai_xygraph(graph, time, values, detailLen, ri, 10);
   }
 }
 
@@ -337,7 +335,7 @@ static void signalIQ(OAIgraph_t *graph,OAI_phy_scope_t *scope)
     Q[k] = scope->freqDomain[k].i;
   }
 
-  oai_xygraph(graph, I, Q,  scope->context->dft_sz, 0, 10);
+  oai_xygraph(graph, I, Q,  scope->context->dft_sz, 0, 100);
 }
 static void signalIQtx(OAIgraph_t *graph,OAI_phy_scope_t *scope)
 {
@@ -350,7 +348,7 @@ static void signalIQtx(OAIgraph_t *graph,OAI_phy_scope_t *scope)
     Q[k] = scope->freqDomainTx[k].i;
   }
 
-  oai_xygraph(graph, I, Q, scope->context->dft_sz, 0, 10);
+  oai_xygraph(graph, I, Q, scope->context->dft_sz, 0, 100);
 }
 
 static OAI_phy_scope_t *createScopeCalibration(threads_t *context)
@@ -380,15 +378,6 @@ static OAI_phy_scope_t *createScopeCalibration(threads_t *context)
   curY+=h+20;
   *graph++ = calibrationCommonGraph(signalIQ, FL_POINTS_XYPLOT, 0, curY, 300, 300, "I/Q of frequency domain", FL_YELLOW);
   *graph++ = calibrationCommonGraph(signalIQtx, FL_POINTS_XYPLOT, 500, curY, 300, 300, "Tx generated I/Q of frequency domain", FL_YELLOW);
-  fl_get_object_bbox(fdui->graph[3].graph,&x, &y,&w, &h);
-  // LLR of PUSCH
-  //fdui->graph[3] = calibrationCommonGraph( puschLLR, FL_POINTS_XYPLOT, 0, curY, 500, 200, "PUSCH Log-Likelihood Ratios (LLR, mag)", FL_YELLOW );
-  // I/Q PUSCH comp
-  //curY+=h+20;
-  fl_get_object_bbox(fdui->graph[4].graph,&x, &y,&w, &h);
-  curY+=h;
-  //fl_get_object_bbox(fdui->graph[6].graph,&x, &y,&w, &h);
-  curY += h;
   fl_end_form( );
   fdui->phy_scope->fdui = fdui;
   fl_show_form(fdui->phy_scope, FL_PLACE_HOTSPOT, FL_FULLBORDER, "calibration SCOPE");
