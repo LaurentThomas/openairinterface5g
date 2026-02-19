@@ -88,7 +88,7 @@ static const uint64_t magic_tx = 0xA5A50be3A5A5A5A5LL;
 static const uint64_t magic_rx = 0xA5A50be3A5A5A5A5LL;
 static const uint32_t magic_footer1 = 0xce11;
 static const uint32_t magic_footer2 = 0x5A;
-static const uint64_t tx_ahead = WRITE_BLOCK_NB_SAMPLES * 24;
+static const uint64_t tx_ahead = WRITE_BLOCK_NB_SAMPLES * 16;
 
 typedef struct {
   uint64_t control;
@@ -325,7 +325,7 @@ static inline int write_block(oc_state_t *s, c16_t *samples, uint sz)
                          .ppsOffset = 0x28272625,
                          .timestamp = (uint64_t)s->tx_ts-170};
   for (uint i = 0; i < sz; i++)
-    ant0->b[i] = (c16_t){(int16_t)(samples[i].r << 4), (int16_t)(samples[i].i << 4)};
+    ant0->b[i] = (c16_t){(int16_t)(samples[i].r), (int16_t)(samples[i].i)};
   // memcpy(ant0->b, samples, sz * sizeof(c16_t));
   s->tx_ts += sz;
   s->tx_block_pos++;
