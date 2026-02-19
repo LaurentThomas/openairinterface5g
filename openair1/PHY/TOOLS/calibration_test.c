@@ -53,34 +53,71 @@ void *write_thread(void *arg)
   const float WAVE_AMP = params->c->amplitude;
   const float sin_freq = params->c->sinus_freq;
 
-  if (params->c->chirp) {
-    double Fs = 122880.0;
-    double f0 =  -40000.0;   // start freq
-    double f1 =   40000.0;  // end freq
-    double T  = params->dft_sz / Fs;
-    double k  = (f1 - f0) / T; // Hz/s sweep rate
-    
-    for (int i = 0; i < params->dft_sz; i++) {
-      double t = ts / Fs;
-      double phase = 2 * M_PI * (f0 * t + 0.5 * k * t * t);
-      samplesTx[0][i].r = WAVE_AMP * cos(phase);
-      samplesTx[0][i].i = WAVE_AMP * sin(phase);
-      ts++;
-    }
-  } else {
-    for (int i = 0; i < params->dft_sz; i++) {
-      // Better to select a frequency having an integer division with the sampling rate to avoid having DFT leakage later on
-      //  .r = cos and .i = sin -> having a positive spectrum
-      //  For negative spectrum -> .r = sin and .i = cos
-      samplesTx[0][i].r = WAVE_AMP * cos((ts * M_PI * 2 * sin_freq) / 122880000);
-      samplesTx[0][i].i = WAVE_AMP * sin((ts * M_PI * 2 * sin_freq) / 122880000); // samplesTx[0][i].r;
-      // Hamming Window - to allow some pseudo-continuity between batches as this is not a continuously generated signal as in real
-      // life
-      // samplesTx[0][i].r = (samplesTx[0][i].r) * (0.54 - 0.46 * cos(2 * M_PI * i / (params->dft_sz-1)));
-      // samplesTx[0][i].i = (samplesTx[0][i].i) * (0.54 - 0.46 * cos(2 * M_PI * i / (params->dft_sz-1)));
-      // samplesTx[0][i]=(c16_t){i,-params->dft_sz+i};
-      ts++;
-    }
+  switch (params->c->tx_pattern) {
+    case e_CHIRP: {
+      double Fs = 122880.0;
+      double f0 = -30 * 1000.0; // start freq
+      double f1 = 30 * 1000.0; // end freq
+      double T = params->dft_sz / Fs;
+      double k = (f1 - f0) / T; // Hz/s sweep rate
+
+      for (int i = 0; i < params->dft_sz; i++) {
+        double t = ts / Fs;
+        double phase = 2 * M_PI * (f0 * t + 0.5 * k * t * t);
+        samplesTx[0][i].r = WAVE_AMP * cos(phase);
+        samplesTx[0][i].i = WAVE_AMP * sin(phase);
+        ts++;
+      }
+    } break;
+    case e_QAM_256: {
+      __attribute__((aligned(32))) c16_t freq_signal[params->dft_sz] = {};
+      for (int carrier = 0; carrier < params->dft_sz; carrier++) {
+        const float sqrt2 = 0.70711;
+        const float sqrt170 = 0.076696;
+        int amp = WAVE_AMP * sqrt170 * sqrt2;
+        int i = rand() % 256;
+        freq_signal[carrier] = (c16_t){
+            ((1 - 2 * (i & 1)) * (8 - (1 - 2 * ((i >> 2) & 1)) * (4 - (1 - 2 * ((i >> 4) & 1)) * (2 - (1 - 2 * ((i >> 6) & 1))))))
+                * amp,
+            (1 - 2 * ((i >> 1) & 1))
+                * (8 - (1 - 2 * ((i >> 3) & 1)) * (4 - (1 - 2 * ((i >> 5) & 1)) * (2 - (1 - 2 * ((i >> 7) & 1))))) * amp};
+        ts++;
+      }
+      dft(get_dft(params->dft_sz), (int16_t *)freq_signal, (int16_t *)samplesTx[0], 1);
+      /*
+      for (int a = 0; a < 64; a++) {
+        float wave_i = WAVE_AMP * sqrt(2) / ((a % 8) - 4);
+        float wave_q = WAVE_AMP * sqrt(2) / ((a % 8) - 4);
+        for (int i = 0; i < params->dft_sz; i++) {
+          // Better to select a frequency having an integer division with the sampling rate to avoid having DFT leakage later on
+          //  .r = cos and .i = sin -> having a positive spectrum
+          //  For negative spectrum -> .r = sin and .i = cos
+          samplesTx[0][i].r += wave_i * cos((ts * M_PI * 2 * sin_freq) / 122880000);
+          samplesTx[0][i].i += wave_q * sin((ts * M_PI * 2 * sin_freq) / 122880000); // samplesTx[0][i].r;
+          // Hamming Window - to allow some pseudo-continuity between batches as this is not a continuously generated signal as in
+          // real life samplesTx[0][i].r = (samplesTx[0][i].r) * (0.54 - 0.46 * cos(2 * M_PI * i / (params->dft_sz-1)));
+          // samplesTx[0][i].i = (samplesTx[0][i].i) * (0.54 - 0.46 * cos(2 * M_PI * i / (params->dft_sz-1)));
+          // samplesTx[0][i]=(c16_t){i,-params->dft_sz+i};
+          ts++;
+        }
+        }*/
+    } break;
+    case e_SINUS:
+      for (int i = 0; i < params->dft_sz; i++) {
+        // Better to select a frequency having an integer division with the sampling rate to avoid having DFT leakage later on
+        //  .r = cos and .i = sin -> having a positive spectrum
+        //  For negative spectrum -> .r = sin and .i = cos
+        samplesTx[0][i].r = WAVE_AMP * cos((ts * M_PI * 2 * sin_freq) / 122880000);
+        samplesTx[0][i].i = WAVE_AMP * sin((ts * M_PI * 2 * sin_freq) / 122880000); // samplesTx[0][i].r;
+        // Hamming Window - to allow some pseudo-continuity between batches as this is not a continuously generated signal as in
+        // real life samplesTx[0][i].r = (samplesTx[0][i].r) * (0.54 - 0.46 * cos(2 * M_PI * i / (params->dft_sz-1)));
+        // samplesTx[0][i].i = (samplesTx[0][i].i) * (0.54 - 0.46 * cos(2 * M_PI * i / (params->dft_sz-1)));
+        // samplesTx[0][i]=(c16_t){i,-params->dft_sz+i};
+        ts++;
+      }
+      break;
+    default:
+      abort();
   }
 
   double avg = 0;
@@ -235,11 +272,16 @@ int main(int argc, char **argv) {
       {"tx", "enable tx", 0, .uptr = &c.tx, .defintval = 1, TYPE_UINT, 0},
       {"rx", "enable tx", 0, .uptr = &c.rx, .defintval = 1, TYPE_UINT, 0},
       {"freq", "center frequency in kHz", 0, .uptr = &c.freq, .defintval = 1, TYPE_UINT, 0},
-      {"chirp", "generate signal for full I/Q (circle), constant amplitude",
-       0, .uptr = &c.chirp,.defintval = 1, TYPE_UINT, 0},
+      {"tx_pattern",
+       "generate signal for a chirp (0), qam-64 (1) or pure sinewave (default)",
+       0,
+       .uptr = &c.tx_pattern,
+       .defintval = 2,
+       TYPE_UINT,
+       0},
       {"amplitude", "signal amplitude (int16)", 0, .uptr = &c.amplitude, .defintval = 2047, TYPE_UINT, 0},
-      {"sinus_freq", "if chirp is false, sinut frequency in KHz", .uptr=&c.sinus_freq, .defintval = 10000, TYPE_UINT, 0},
-      {"dft", "dft size for signal frequency/time convertion",  .uptr = &c.dft, .defintval = 8192, TYPE_UINT, 0},
+      {"sinus_freq", "if chirp is false, sinut frequency in KHz", .uptr = &c.sinus_freq, .defintval = 10000, TYPE_UINT, 0},
+      {"dft", "dft size for signal frequency/time convertion", .uptr = &c.dft, .defintval = 8192, TYPE_UINT, 0},
   };
   config_process_cmdline(uniqCfg, cmdline_params, sizeofArray(cmdline_params), NULL);
   CONFIG_CLEARRTFLAG(CONFIG_NOEXITONHELP);
