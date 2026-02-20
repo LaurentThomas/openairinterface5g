@@ -69,6 +69,32 @@ void *write_thread(void *arg)
         ts++;
       }
     } break;
+    case e_QPSK: {
+      __attribute__((aligned(32))) c16_t freq_signal[params->dft_sz] = {};
+      int val = 0;
+      for (int carrier = 0; carrier < params->dft_sz; carrier++) {
+        const float sqrt2 = 0.70711;
+        int amp = WAVE_AMP * sqrt2 * sqrt2;
+        int i = rand() % 4;
+        val ^= 1 << i;
+        freq_signal[carrier] = (c16_t){(1 - 2 * (val & 1)) * amp, (1 - 2 * ((val >> 1) & 1)) * amp};
+        ts++;
+      }
+      dft(get_dft(params->dft_sz), (int16_t *)freq_signal, (int16_t *)samplesTx[0], 1);
+    } break;
+    case e_QAM_16: {
+      __attribute__((aligned(32))) c16_t freq_signal[params->dft_sz] = {};
+      for (int carrier = 0; carrier < params->dft_sz; carrier++) {
+        const float sqrt2 = 0.70711;
+        const float sqrt10 = 0.31623;
+        int amp = WAVE_AMP * sqrt10 * sqrt2;
+        int i = rand() % 16;
+        freq_signal[carrier] = (c16_t){(1 - 2 * (i & 1)) * (2 - (1 - 2 * ((i >> 2) & 1))) * amp,
+                                       (1 - 2 * ((i >> 1) & 1)) * (2 - (1 - 2 * ((i >> 3) & 1))) * amp};
+        ts++;
+      }
+      dft(get_dft(params->dft_sz), (int16_t *)freq_signal, (int16_t *)samplesTx[0], 1);
+    } break;
     case e_QAM_256: {
       __attribute__((aligned(32))) c16_t freq_signal[params->dft_sz] = {};
       for (int carrier = 0; carrier < params->dft_sz; carrier++) {
@@ -84,23 +110,6 @@ void *write_thread(void *arg)
         ts++;
       }
       dft(get_dft(params->dft_sz), (int16_t *)freq_signal, (int16_t *)samplesTx[0], 1);
-      /*
-      for (int a = 0; a < 64; a++) {
-        float wave_i = WAVE_AMP * sqrt(2) / ((a % 8) - 4);
-        float wave_q = WAVE_AMP * sqrt(2) / ((a % 8) - 4);
-        for (int i = 0; i < params->dft_sz; i++) {
-          // Better to select a frequency having an integer division with the sampling rate to avoid having DFT leakage later on
-          //  .r = cos and .i = sin -> having a positive spectrum
-          //  For negative spectrum -> .r = sin and .i = cos
-          samplesTx[0][i].r += wave_i * cos((ts * M_PI * 2 * sin_freq) / 122880000);
-          samplesTx[0][i].i += wave_q * sin((ts * M_PI * 2 * sin_freq) / 122880000); // samplesTx[0][i].r;
-          // Hamming Window - to allow some pseudo-continuity between batches as this is not a continuously generated signal as in
-          // real life samplesTx[0][i].r = (samplesTx[0][i].r) * (0.54 - 0.46 * cos(2 * M_PI * i / (params->dft_sz-1)));
-          // samplesTx[0][i].i = (samplesTx[0][i].i) * (0.54 - 0.46 * cos(2 * M_PI * i / (params->dft_sz-1)));
-          // samplesTx[0][i]=(c16_t){i,-params->dft_sz+i};
-          ts++;
-        }
-        }*/
     } break;
     case e_SINUS:
       for (int i = 0; i < params->dft_sz; i++) {

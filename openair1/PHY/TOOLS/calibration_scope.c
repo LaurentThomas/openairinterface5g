@@ -398,7 +398,10 @@ void calibrationScope(OAI_phy_scope_t  *form) {
   memcpy(form->timeDomain, form->context->samplesRx[0], len * sizeof(*form->timeDomain));
   memcpy(form->timeDomainTx, form->context->samplesTx[0], len * sizeof(*form->timeDomainTx));
   pthread_mutex_unlock(&form->context->rxMutex);
-  dft(get_dft(len), (int16_t *)form->timeDomain, (int16_t *)form->freqDomain, 1);		     
+  __attribute__((aligned(32))) c16_t signal[len];
+  for (int i = 0; i < len; i++)
+    signal[i] = (c16_t){form->timeDomain[i].r, form->timeDomain[i].i};
+  dft(get_dft(len), (int16_t *)signal, (int16_t *)form->freqDomain, 1);
   dft(get_dft(len), (int16_t *)form->timeDomainTx, (int16_t *)form->freqDomainTx, 1);
 
   int i = 0;
