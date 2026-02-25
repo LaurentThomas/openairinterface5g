@@ -11,6 +11,7 @@ typedef struct {
   uint amplitude;
   uint sinus_freq;
   uint dft;
+  char * file;
 } config_t;
 
 typedef struct {
