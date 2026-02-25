@@ -5,6 +5,8 @@
 #define __USE_GNU
 #include <stdint.h>
 #include "openair1/PHY/defs_common.h"
+#include <sys/stat.h>
+#include <openair1/PHY/impl_defs_top.h>
 #include <radio/COMMON/common_lib.h>
 #include <executables/softmodem-common.h>
 #include <openair1/PHY/TOOLS/calibration_scope.h>
@@ -111,6 +113,50 @@ static inline uint8_t rand_u8(void)
   return val;
 }
 
+static c16_t * read_file (char * filename, int *sz) {
+  int fd=open(filename,O_RDONLY);
+  if (fd < 0)
+    abort();
+  struct stat st;
+  stat(filename, &st);
+  char * f=mmap(NULL,st.st_size ,PROT_READ, MAP_PRIVATE, fd, 0);
+  char* p=f;
+  int count=0;
+  char tmp[64];
+  char* endfile=f+st.st_size;
+  do {
+    while ((*p < '0' || *p > '9') && *p != '-' && p<endfile)
+      p++;
+    if (p != endfile) {
+      count ++;
+      // begining of number
+      char * end=p;
+      while (((*end >= '0' && *end <= '9') || *end == '-') && end< endfile)
+	end++;
+      p=end;
+    }
+  } while (p && p<endfile);
+  int16_t *vect=malloc(count * sizeof(*vect));
+  int16_t* ptr=vect;
+  p=f;
+  do {
+    while ((*p < '0' || *p > '9') && *p != '-' && p<endfile)
+      p++;
+    if (p != endfile) {
+      // begining of number
+      char * end=p;
+      while (((*end >= '0' && *end <= '9') || *end == '-') && end< endfile)
+	end++;
+      memcpy(tmp,p,end-p);
+      tmp[end-p]=0;
+      *ptr++=atoi(tmp);
+      p=end;
+    }
+  } while (p && p<endfile);
+  *sz=count/2;
+  return (c16_t*)vect;
+}
+
 void *write_thread(void *arg)
 {
   threads_t *params = (threads_t *)arg;
@@ -118,8 +164,12 @@ void *write_thread(void *arg)
   uint64_t ts = 0;
   const float WAVE_AMP = params->c->amplitude;
   const float sin_freq = params->c->sinus_freq;
-
-  switch (params->c->tx_pattern) {
+  c16_t * file_input=NULL;
+  int num_samples=0;
+  if ( params->c->file)
+    file_input=read_file(params->c->file, &num_samples);
+  else {
+    switch (params->c->tx_pattern) {
     case e_CHIRP: {
       double Fs = 122880.0;
       double f0 = -30 * 1000.0; // start freq
@@ -192,8 +242,8 @@ void *write_thread(void *arg)
         if (carrier >= bin_masking && carrier <= (center + bin_masking)) {
           int i = rand_u6(); // rand() % 64;
           freq_signal[carrier] =
-              (c16_t){((1 - 2 * (i & 1)) * (4 - (1 - 2 * ((i >> 2) & 1)) * (2 - (1 - 2 * ((i >> 4) & 1))))) * amp,
-                      ((1 - 2 * ((i >> 1) & 1)) * (4 - (1 - 2 * ((i >> 3) & 1)) * (2 - (1 - 2 * ((i >> 5) & 1))))) * amp};
+	    (c16_t){((1 - 2 * (i & 1)) * (4 - (1 - 2 * ((i >> 2) & 1)) * (2 - (1 - 2 * ((i >> 4) & 1))))) * amp,
+		    ((1 - 2 * ((i >> 1) & 1)) * (4 - (1 - 2 * ((i >> 3) & 1)) * (2 - (1 - 2 * ((i >> 5) & 1))))) * amp};
         } else {
           freq_signal[carrier].r = 0;
           freq_signal[carrier].i = 0;
@@ -204,14 +254,21 @@ void *write_thread(void *arg)
     } break;
     case e_QAM_256: {
       __attribute__((aligned(32))) c16_t freq_signal[params->dft_sz] = {};
+      const float required_BW = 4000.0e3;
+      const float dft_binsize = ((float)122.88e6 / (float)params->dft_sz);
+      int center = dft_binsize / 2;
+      float sqrt42 = 0.15430;
+      const float sqrt2 = 0.70711;
+      int amp = WAVE_AMP * sqrt42 * sqrt2;
+      int bin_masking = (int)(((float)122.88e6 - required_BW) / (float)dft_binsize);
       for (int carrier = 0; carrier < params->dft_sz; carrier++) {
         if (carrier >= bin_masking && carrier <= (center + bin_masking)) {
           int i = rand_u8(); // rand() % 256;
           freq_signal[carrier] = (c16_t){
-              ((1 - 2 * (i & 1)) * (8 - (1 - 2 * ((i >> 2) & 1)) * (4 - (1 - 2 * ((i >> 4) & 1)) * (2 - (1 - 2 * ((i >> 6) & 1))))))
-                  * amp,
-              (1 - 2 * ((i >> 1) & 1))
-                  * (8 - (1 - 2 * ((i >> 3) & 1)) * (4 - (1 - 2 * ((i >> 5) & 1)) * (2 - (1 - 2 * ((i >> 7) & 1))))) * amp};
+	    ((1 - 2 * (i & 1)) * (8 - (1 - 2 * ((i >> 2) & 1)) * (4 - (1 - 2 * ((i >> 4) & 1)) * (2 - (1 - 2 * ((i >> 6) & 1))))))
+	    * amp,
+	    (1 - 2 * ((i >> 1) & 1))
+	    * (8 - (1 - 2 * ((i >> 3) & 1)) * (4 - (1 - 2 * ((i >> 5) & 1)) * (2 - (1 - 2 * ((i >> 7) & 1))))) * amp};
         } else {
           freq_signal[carrier].r = 0;
           freq_signal[carrier].i = 0;
@@ -236,8 +293,8 @@ void *write_thread(void *arg)
       break;
     default:
       abort();
+    }
   }
-
   double avg = 0;
   for (int i = 0; i < params->dft_sz; i++) {
     avg += sqrt(squaredMod(samplesTx[0][i]));
@@ -251,6 +308,7 @@ void *write_thread(void *arg)
   // this is tx ahead in main application, the driver has it's tx ahead that shuld be smaller to prevent starvation
   const int tx_ahead =  params->dft_sz * 20;
   char *flag = getenv("HOLE");
+  uint64_t num_samples_file=0;
   while (!oai_exit) {
     do {
       AssertFatal(!pthread_mutex_lock(&params->txMutex), "");
@@ -266,6 +324,10 @@ void *write_thread(void *arg)
     }
     do {
       last_tx_timestamp += params->dft_sz;
+      if (num_samples) {
+	for (int i=0; i< params->dft_sz; i++)
+	  samplesTx[0][i]=file_input[(num_samples_file++)%num_samples];
+      }
       c16_t tmp[25];
       int loc=rand()%8000;
       if (flag && count % 1935 == 0) {
@@ -385,7 +447,7 @@ int main(int argc, char **argv) {
   CONFIG_SETRTFLAG(CONFIG_NOEXITONHELP);
   get_common_options(uniqCfg);
 
-  config_t c = {1, 1, 3750000, 1, 2047, 10000, 8192};
+  config_t c = {1, 1, 3750000, 1, 2047, 10000, 8192, NULL};
   paramdef_t cmdline_params[] = {
       {"tx", "enable tx", 0, .uptr = &c.tx, .defintval = 1, TYPE_UINT, 0},
       {"rx", "enable tx", 0, .uptr = &c.rx, .defintval = 1, TYPE_UINT, 0},
@@ -400,6 +462,7 @@ int main(int argc, char **argv) {
       {"amplitude", "signal amplitude (int16)", 0, .uptr = &c.amplitude, .defintval = 2047, TYPE_UINT, 0},
       {"sinus_freq", "if chirp is false, sinut frequency in KHz", .uptr = &c.sinus_freq, .defintval = 10000, TYPE_UINT, 0},
       {"dft", "dft size for signal frequency/time convertion", .uptr = &c.dft, .defintval = 8192, TYPE_UINT, 0},
+      {"file", "input I/Q samples in ascii, sequence I then Q\n", PARAMFLAG_MALLOCINCONFIG, .strptr = &c.file, .defstrval = NULL, TYPE_STRING, 0},
   };
   config_process_cmdline(uniqCfg, cmdline_params, sizeofArray(cmdline_params), NULL);
   CONFIG_CLEARRTFLAG(CONFIG_NOEXITONHELP);

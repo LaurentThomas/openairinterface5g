@@ -402,7 +402,9 @@ void calibrationScope(OAI_phy_scope_t  *form) {
   for (int i = 0; i < len; i++)
     signal[i] = (c16_t){form->timeDomain[i].r, form->timeDomain[i].i};
   dft(get_dft(len), (int16_t *)signal, (int16_t *)form->freqDomain, 1);
-  dft(get_dft(len), (int16_t *)form->timeDomainTx, (int16_t *)form->freqDomainTx, 1);
+  for (int i = 0; i < len; i++)
+    signal[i] = (c16_t){form->timeDomainTx[i].r, form->timeDomainTx[i].i};
+  dft(get_dft(len), (int16_t *)signal, (int16_t *)form->freqDomainTx, 1);
 
   int i = 0;
   while (form->graph[i].graph) {
