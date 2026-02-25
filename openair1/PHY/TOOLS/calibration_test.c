@@ -45,6 +45,72 @@ openair0_timestamp_t tx_timestamp = 0;
 openair0_timestamp_t last_hole = 0;
 pthread_cond_t tx_trig;
 
+static uint32_t rng_state = 2463534242u; // non-zero seed
+
+static inline uint32_t xorshift32(void)
+{
+  uint32_t x = rng_state;
+  x ^= x << 13;
+  x ^= x >> 17;
+  x ^= x << 5;
+  rng_state = x;
+  return x;
+}
+
+/* ------------------ Bit pool ------------------ */
+static uint32_t bit_pool = 0;
+static int bits_left = 0;
+
+/* Ensure at least n bits available */
+static inline void refill_bits(int n)
+{
+  if (bits_left < n) {
+    bit_pool = xorshift32();
+    bits_left = 32;
+  }
+}
+
+/* ------------------ Uniform generators ------------------ */
+
+/* 2-bit uniform [0..3] */
+static inline uint8_t rand_u2(void)
+{
+  refill_bits(2);
+  uint8_t val = bit_pool & 0x3;
+  bit_pool >>= 2;
+  bits_left -= 2;
+  return val;
+}
+
+/* 4-bit uniform [0..15] */
+static inline uint8_t rand_u4(void)
+{
+  refill_bits(4);
+  uint8_t val = bit_pool & 0xF;
+  bit_pool >>= 4;
+  bits_left -= 4;
+  return val;
+}
+
+static inline uint8_t rand_u6(void)
+{
+  refill_bits(6);
+  uint8_t val = bit_pool & 0x3F; // 6 bits
+  bit_pool >>= 6;
+  bits_left -= 6;
+  return val;
+}
+
+/* 8-bit uniform [0..255] */
+static inline uint8_t rand_u8(void)
+{
+  refill_bits(8);
+  uint8_t val = bit_pool & 0xFF;
+  bit_pool >>= 8;
+  bits_left -= 8;
+  return val;
+}
+
 void *write_thread(void *arg)
 {
   threads_t *params = (threads_t *)arg;
@@ -70,27 +136,68 @@ void *write_thread(void *arg)
       }
     } break;
     case e_QPSK: {
-      __attribute__((aligned(32))) c16_t freq_signal[params->dft_sz] = {};
+      __attribute__((aligned(32))) c16_t freq_signal[params->dft_sz];
       int val = 0;
+      const float required_BW = 6000.0e3;
+      const float dft_binsize = ((float)122.88e6 / (float)params->dft_sz);
+      const float sqrt2 = 0.70711;
+      int amp = WAVE_AMP * sqrt2 * sqrt2;
+      int center = dft_binsize / 2;
+      int bin_masking = (int)(((float)122.88e6 - required_BW) / (float)dft_binsize);
       for (int carrier = 0; carrier < params->dft_sz; carrier++) {
-        const float sqrt2 = 0.70711;
-        int amp = WAVE_AMP * sqrt2 * sqrt2;
-        int i = rand() % 4;
-        val ^= 1 << i;
-        freq_signal[carrier] = (c16_t){(1 - 2 * (val & 1)) * amp, (1 - 2 * ((val >> 1) & 1)) * amp};
+        if (carrier >= bin_masking && carrier <= (center + bin_masking)) {
+          int i = rand_u2(); // rand() % 4;
+          val ^= 1 << i;
+          freq_signal[carrier] = (c16_t){(1 - 2 * (val & 1)) * amp, (1 - 2 * ((val >> 1) & 1)) * amp};
+        } else {
+          freq_signal[carrier].r = 0;
+          freq_signal[carrier].i = 0;
+        }
         ts++;
       }
       dft(get_dft(params->dft_sz), (int16_t *)freq_signal, (int16_t *)samplesTx[0], 1);
     } break;
     case e_QAM_16: {
-      __attribute__((aligned(32))) c16_t freq_signal[params->dft_sz] = {};
+      __attribute__((aligned(32))) c16_t freq_signal[params->dft_sz];
+      const float required_BW = 15000.0e3;
+      const float dft_binsize = ((float)122.88e6 / (float)params->dft_sz);
+      const float sqrt2 = 0.70711;
+      const float sqrt10 = 0.31623;
+      int center = dft_binsize / 2;
+      int amp = WAVE_AMP * sqrt10 * sqrt2;
+      int bin_masking = (int)(((float)122.88e6 - required_BW) / (float)dft_binsize);
       for (int carrier = 0; carrier < params->dft_sz; carrier++) {
-        const float sqrt2 = 0.70711;
-        const float sqrt10 = 0.31623;
-        int amp = WAVE_AMP * sqrt10 * sqrt2;
-        int i = rand() % 16;
-        freq_signal[carrier] = (c16_t){(1 - 2 * (i & 1)) * (2 - (1 - 2 * ((i >> 2) & 1))) * amp,
-                                       (1 - 2 * ((i >> 1) & 1)) * (2 - (1 - 2 * ((i >> 3) & 1))) * amp};
+        if (carrier >= bin_masking && carrier <= (center + bin_masking)) {
+          int i = rand_u4(); // rand() % 16;
+          freq_signal[carrier].r = (1 - 2 * (i & 1)) * (2 - (1 - 2 * ((i >> 2) & 1))) * amp;
+          freq_signal[carrier].i = (1 - 2 * ((i >> 1) & 1)) * (2 - (1 - 2 * ((i >> 3) & 1))) * amp;
+        } else {
+          freq_signal[carrier].r = 0;
+          freq_signal[carrier].i = 0;
+        }
+        ts++;
+      }
+      dft(get_dft(params->dft_sz), (int16_t *)freq_signal, (int16_t *)samplesTx[0], 1);
+    } break;
+    case e_QAM_64: {
+      __attribute__((aligned(32))) c16_t freq_signal[params->dft_sz];
+      const float required_BW = 4000.0e3;
+      const float dft_binsize = ((float)122.88e6 / (float)params->dft_sz);
+      const float sqrt2 = 0.70711;
+      const float sqrt42 = 0.154303;
+      int center = dft_binsize / 2;
+      int amp = WAVE_AMP * sqrt42 * sqrt2;
+      int bin_masking = (int)(((float)122.88e6 - required_BW) / (float)dft_binsize);
+      for (int carrier = 0; carrier < params->dft_sz; carrier++) {
+        if (carrier >= bin_masking && carrier <= (center + bin_masking)) {
+          int i = rand_u6(); // rand() % 64;
+          freq_signal[carrier] =
+              (c16_t){((1 - 2 * (i & 1)) * (4 - (1 - 2 * ((i >> 2) & 1)) * (2 - (1 - 2 * ((i >> 4) & 1))))) * amp,
+                      ((1 - 2 * ((i >> 1) & 1)) * (4 - (1 - 2 * ((i >> 3) & 1)) * (2 - (1 - 2 * ((i >> 5) & 1))))) * amp};
+        } else {
+          freq_signal[carrier].r = 0;
+          freq_signal[carrier].i = 0;
+        }
         ts++;
       }
       dft(get_dft(params->dft_sz), (int16_t *)freq_signal, (int16_t *)samplesTx[0], 1);
@@ -98,15 +205,17 @@ void *write_thread(void *arg)
     case e_QAM_256: {
       __attribute__((aligned(32))) c16_t freq_signal[params->dft_sz] = {};
       for (int carrier = 0; carrier < params->dft_sz; carrier++) {
-        const float sqrt2 = 0.70711;
-        const float sqrt170 = 0.076696;
-        int amp = WAVE_AMP * sqrt170 * sqrt2;
-        int i = rand() % 256;
-        freq_signal[carrier] = (c16_t){
-            ((1 - 2 * (i & 1)) * (8 - (1 - 2 * ((i >> 2) & 1)) * (4 - (1 - 2 * ((i >> 4) & 1)) * (2 - (1 - 2 * ((i >> 6) & 1))))))
-                * amp,
-            (1 - 2 * ((i >> 1) & 1))
-                * (8 - (1 - 2 * ((i >> 3) & 1)) * (4 - (1 - 2 * ((i >> 5) & 1)) * (2 - (1 - 2 * ((i >> 7) & 1))))) * amp};
+        if (carrier >= bin_masking && carrier <= (center + bin_masking)) {
+          int i = rand_u8(); // rand() % 256;
+          freq_signal[carrier] = (c16_t){
+              ((1 - 2 * (i & 1)) * (8 - (1 - 2 * ((i >> 2) & 1)) * (4 - (1 - 2 * ((i >> 4) & 1)) * (2 - (1 - 2 * ((i >> 6) & 1))))))
+                  * amp,
+              (1 - 2 * ((i >> 1) & 1))
+                  * (8 - (1 - 2 * ((i >> 3) & 1)) * (4 - (1 - 2 * ((i >> 5) & 1)) * (2 - (1 - 2 * ((i >> 7) & 1))))) * amp};
+        } else {
+          freq_signal[carrier].r = 0;
+          freq_signal[carrier].i = 0;
+        }
         ts++;
       }
       dft(get_dft(params->dft_sz), (int16_t *)freq_signal, (int16_t *)samplesTx[0], 1);
@@ -282,7 +391,7 @@ int main(int argc, char **argv) {
       {"rx", "enable tx", 0, .uptr = &c.rx, .defintval = 1, TYPE_UINT, 0},
       {"freq", "center frequency in kHz", 0, .uptr = &c.freq, .defintval = 1, TYPE_UINT, 0},
       {"tx_pattern",
-       "generate signal for a chirp (0), qam-64 (1) or pure sinewave (default)",
+       "generate signal for a sine (0), chirp (1), qpsk (2), qam-16 (3), qam-64 (4), qam-256 (5)",
        0,
        .uptr = &c.tx_pattern,
        .defintval = 2,
