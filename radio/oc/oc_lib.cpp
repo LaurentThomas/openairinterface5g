@@ -230,6 +230,9 @@ void *write_thread(void *arg)
   FILE* fd=fopen("/tmp/headers", "w");
   fprintf(fd,"time before call xdma, nano sec in xdma write, packet seq num, timestamp\n");
   char * log_headers=getenv("LOGHEADERS");
+  tx_packet_t ref;
+  int seq=0;
+  uint64_t ts;
   do {
     tx_packet_t *p = s->ready_tx->pop();
     if (last_rx + tx_ahead < p->h.timestamp)
@@ -238,6 +241,16 @@ void *write_thread(void *arg)
       last_rx = s->last_rx->pop();
       LOG_D(HW, "pop rx: %lu, rx q sz %lu, tx q sz %lu\n", last_rx, s->last_rx->m_queue.size(), s->ready_tx->m_queue.size());
     }
+    /*
+    // this is test code to repeat same packet forever with continuous tested timestamp
+    if (!seq)
+      memcpy(&ref,p, sizeof(ref));
+    for (int i=0; i<NB_BLOCKS_PER_WRITE; i++) {
+      memcpy(&p[i].b, ref.b, sizeof(ref.b));
+      if (ts!=p[i].h.timestamp)
+	printf("ERROROROROROO\n");
+      ts=p[i].h.timestamp+WRITE_BLOCK_NB_SAMPLES;
+      }*/
     struct timespec b,e;
     clock_gettime(CLOCK_REALTIME,&b);
     size_t wrote = write(s->fd_write, p, sizeof(tx_packet_t) * NB_BLOCKS_PER_WRITE);
@@ -325,7 +338,7 @@ static inline int write_block(oc_state_t *s, c16_t *samples, uint sz)
                          .ppsOffset = 0x28272625,
                          .timestamp = (uint64_t)s->tx_ts-170};
   for (uint i = 0; i < sz; i++)
-    ant0->b[i] = (c16_t){(int16_t)(samples[i].r), (int16_t)(samples[i].i)};
+    ant0->b[i] = (c16_t){(int16_t)(samples[i].r<<3), (int16_t)(samples[i].i<<3)};
   // memcpy(ant0->b, samples, sz * sizeof(c16_t));
   s->tx_ts += sz;
   s->tx_block_pos++;
