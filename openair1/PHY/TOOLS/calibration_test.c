@@ -231,7 +231,7 @@ void *write_thread(void *arg)
     } break;
     case e_QAM_64: {
       __attribute__((aligned(32))) c16_t freq_signal[params->dft_sz];
-      const float required_BW = 4000.0e3;
+      const float required_BW = 12000.0e3;
       const float dft_binsize = ((float)122.88e6 / (float)params->dft_sz);
       const float sqrt2 = 0.70711;
       const float sqrt42 = 0.154303;
@@ -291,8 +291,21 @@ void *write_thread(void *arg)
         ts++;
       }
       break;
+    case e_RAMP:
+      num_samples=65536;
+      file_input=malloc(num_samples * sizeof(*file_input));
+      for (int i=0; i<num_samples; i++)
+	file_input[i]=(c16_t){i-32768, i-32768+1};
+      file_input[num_samples-1].i=-32768;
+      break;
     default:
       abort();
+    }
+    if (params->c->dump_iq) {
+      FILE* h=fopen(params->c->dump_iq,"w");
+      for (int i=0; i<params->dft_sz; i++)
+	fprintf(h, "%04hX%04hX\n", samplesTx[0][i].r,samplesTx[0][i].i);
+      fclose(h);
     }
   }
   double avg = 0;
@@ -463,6 +476,7 @@ int main(int argc, char **argv) {
       {"sinus_freq", "if chirp is false, sinut frequency in KHz", .uptr = &c.sinus_freq, .defintval = 10000, TYPE_UINT, 0},
       {"dft", "dft size for signal frequency/time convertion", .uptr = &c.dft, .defintval = 8192, TYPE_UINT, 0},
       {"file", "input I/Q samples in ascii, sequence I then Q\n", PARAMFLAG_MALLOCINCONFIG, .strptr = &c.file, .defstrval = NULL, TYPE_STRING, 0},
+      {"dump_iq", "dump the tx iq file at begining",  PARAMFLAG_MALLOCINCONFIG, .strptr = &c.dump_iq, .defstrval = NULL, TYPE_STRING, 0},
   };
   config_process_cmdline(uniqCfg, cmdline_params, sizeofArray(cmdline_params), NULL);
   CONFIG_CLEARRTFLAG(CONFIG_NOEXITONHELP);
@@ -542,8 +556,10 @@ int main(int argc, char **argv) {
   pthread_t r_thread;
   if (c.rx)
     threadCreate(&r_thread, read_thread, &params, "read_thr", 2, OAI_PRIORITY_RT);
-  (void)pthread_join(w_thread, NULL);
-  (void)pthread_join(r_thread, NULL);
+  if (c.tx) 
+    (void)pthread_join(w_thread, NULL);
+  if (c.rx)
+    (void)pthread_join(r_thread, NULL);
 
   return 0;
 }

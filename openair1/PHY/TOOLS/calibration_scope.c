@@ -285,12 +285,12 @@ static void zoomIn(OAIgraph_t *graph,  OAI_phy_scope_t *scope)
 {
   static time_t t = 0;
   time_t n = time(NULL);
-  if (n == t)
-    return;
+  //if (n == t)
+  //return;
   t = n;
   int len = scope->context->dft_sz;
   int detailLen = min(len, 750);
-  int beg=max(0, rand()%len - detailLen )/2*2;
+  int beg=0; max(0, rand()%len - detailLen )/2*2;
   for (int ri = 0; ri < 2; ri++) {
     float *values;
     float *time;

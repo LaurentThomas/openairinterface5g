@@ -149,7 +149,7 @@ void *L1_tx_thread(void *arg) {
   while (oai_exit == 0) {
     notifiedFIFO_elt_t *res = NULL;
     do {
-      res = pollNotifiedFIFO(&gNB->L1_tx_out);
+      res = pullNotifiedFIFO(&gNB->L1_tx_out);
       if (!res) {
         LOG_W(HW, "possible underrun\n");
         usleep(300);
