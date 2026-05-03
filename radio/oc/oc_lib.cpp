@@ -205,6 +205,7 @@ typedef struct {
   uint txErr;
   uint timerOverflow;
   uint atomicPacket;
+  bool continuous_tx;
 } oc_state_t;
 
 typedef struct {
@@ -232,14 +233,16 @@ void *write_thread(void *arg)
   char * log_headers=getenv("LOGHEADERS");
   tx_packet_t ref;
   int seq=0;
-  uint64_t ts;
+  uint64_t ts = 0;
   do {
     tx_packet_t *p = s->ready_tx->pop();
-    if (last_rx + tx_ahead < p->h.timestamp)
-      LOG_D(HW, "tx is too ahead, waiting, %lu, %ld\n", p->h.timestamp, p->h.timestamp - last_rx);
-    while (last_rx + tx_ahead < p->h.timestamp) {
-      last_rx = s->last_rx->pop();
-      LOG_D(HW, "pop rx: %lu, rx q sz %lu, tx q sz %lu\n", last_rx, s->last_rx->m_queue.size(), s->ready_tx->m_queue.size());
+    if (!getenv("FAKE_RX")) {
+      if (last_rx + tx_ahead < p->h.timestamp)
+        LOG_D(HW, "tx is too ahead, waiting, %lu, %ld\n", p->h.timestamp, p->h.timestamp - last_rx);
+      while (last_rx + tx_ahead < p->h.timestamp) {
+        last_rx = s->last_rx->pop();
+        LOG_D(HW, "pop rx: %lu, rx q sz %lu, tx q sz %lu\n", last_rx, s->last_rx->m_queue.size(), s->ready_tx->m_queue.size());
+      }
     }
     /*
     // this is test code to repeat same packet forever with continuous tested timestamp
@@ -253,6 +256,13 @@ void *write_thread(void *arg)
       }*/
     struct timespec b,e;
     clock_gettime(CLOCK_REALTIME,&b);
+    if (s->continuous_tx)
+      for (tx_packet_t *j = p; j < p + NB_BLOCKS_PER_WRITE; j++) {
+        if (ts != j->h.timestamp)
+          LOG_E(HW, "tx is not contiguous\n");
+        ts = j->h.timestamp + j->h.packetSz;
+      }
+
     size_t wrote = write(s->fd_write, p, sizeof(tx_packet_t) * NB_BLOCKS_PER_WRITE);
     clock_gettime(CLOCK_REALTIME,&e);
     if (wrote != sizeof(tx_packet_t) * NB_BLOCKS_PER_WRITE)
@@ -336,10 +346,10 @@ static inline int write_block(oc_state_t *s, c16_t *samples, uint sz)
                          .txGain = 0x112233,
                          .filler3 = 0xf0,
                          .ppsOffset = 0x28272625,
-                         .timestamp = (uint64_t)s->tx_ts-170};
-  for (uint i = 0; i < sz; i++)
-    ant0->b[i] = (c16_t){(int16_t)(samples[i].r<<3), (int16_t)(samples[i].i<<3)};
-  // memcpy(ant0->b, samples, sz * sizeof(c16_t));
+                         .timestamp = (uint64_t)s->tx_ts - 170}; // WHY 170 !!!
+  // for (uint i = 0; i < sz; i++)
+  //   ant0->b[i] = (c16_t){(int16_t)(samples[i].r), (int16_t)(samples[i].i)};
+  memcpy(ant0->b, samples, sz * sizeof(c16_t));
   s->tx_ts += sz;
   s->tx_block_pos++;
   s->tx_count++;
@@ -551,7 +561,8 @@ void *read_thread(void *arg)
       continue;
     }
     if (s->read_queue->m_queue.size() > 100) {
-      LOG_W(HW, "rx consumer is too slow, trashing rx queue\n");
+      if (!getenv("FAKE_RX"))
+        LOG_W(HW, "rx consumer is too slow, trashing rx queue\n");
       while (s->read_queue->m_queue.size())
         free(s->read_queue->pop());
     }
@@ -568,6 +579,13 @@ void *read_thread(void *arg)
 static int oc_read(openair0_device_t *device, openair0_timestamp_t *ptimestamp, void **buff, int nsamps, int cc)
 {
   oc_state_t *s = (oc_state_t *)device->priv;
+  static uint64_t reads_cnt = 0;
+  if (getenv("FAKE_RX") && reads_cnt > atoi(getenv("FAKE_RX"))) {
+    *ptimestamp = s->rx_ts_interface;
+    s->rx_ts_interface += nsamps;
+    return nsamps;
+  }
+  reads_cnt++;
   c16_t **output=(c16_t**)buff;
   int remain_to_get=nsamps;
   while (remain_to_get > 0) {
@@ -766,6 +784,7 @@ extern "C" {
       strcpy(st->filename_write, DEVICE_WRITE_DEFAULT);
       strcpy(st->filename_read, DEVICE_READ_DEFAULT);
       AssertFatal(st != NULL, "OC device: memory allocation failure\n");
+      st->continuous_tx = openair0_cfg->duplex_mode == duplex_mode_FDD;
     } else {
       LOG_E(HW, "multiple calls to device init detected\n");
       return 0;
