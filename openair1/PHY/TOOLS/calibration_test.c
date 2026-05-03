@@ -287,16 +287,18 @@ void *write_thread(void *arg)
         // Hamming Window - to allow some pseudo-continuity between batches as this is not a continuously generated signal as in
         // real life samplesTx[0][i].r = (samplesTx[0][i].r) * (0.54 - 0.46 * cos(2 * M_PI * i / (params->dft_sz-1)));
         // samplesTx[0][i].i = (samplesTx[0][i].i) * (0.54 - 0.46 * cos(2 * M_PI * i / (params->dft_sz-1)));
-        // samplesTx[0][i]=(c16_t){i,-params->dft_sz+i};
+        // samplesTx[0][i].r = (samplesTx[0][i].r) * (0.54 - 0.46 * cos(2 * M_PI * i / (params->dft_sz-1)));
         ts++;
       }
       break;
     case e_RAMP:
-      num_samples=65536;
+      num_samples = 2048;
+      const int16_t RAMP_STEP_SIZE = 1;
       file_input=malloc(num_samples * sizeof(*file_input));
-      for (int i=0; i<num_samples; i++)
-	file_input[i]=(c16_t){i-32768, i-32768+1};
-      file_input[num_samples-1].i=-32768;
+      for (int i = 0; i < num_samples; i++) {
+        file_input[i] = (c16_t){i * RAMP_STEP_SIZE, 2047 - i * RAMP_STEP_SIZE};
+        // printf("%d, %d\n", file_input[i].r, file_input[i].i);
+      }
       break;
     default:
       abort();
@@ -317,18 +319,25 @@ void *write_thread(void *arg)
   struct timespec last_second;
   clock_gettime(CLOCK_REALTIME, &last_second);
 
-  openair0_timestamp_t last_tx_timestamp = 0, new_tx = 0;
+  openair0_timestamp_t last_tx_timestamp = 0;
   // this is tx ahead in main application, the driver has it's tx ahead that shuld be smaller to prevent starvation
   const int tx_ahead =  params->dft_sz * 20;
   char *flag = getenv("HOLE");
   uint64_t num_samples_file=0;
+  uint64_t tx_cnt = 0;
   while (!oai_exit) {
-    do {
-      AssertFatal(!pthread_mutex_lock(&params->txMutex), "");
-      AssertFatal(!pthread_cond_wait(&tx_trig, &params->txMutex), "");
-      new_tx = tx_timestamp & ~31;
-      AssertFatal(!pthread_mutex_unlock(&params->txMutex), "");
-    } while (last_tx_timestamp == new_tx);
+    openair0_timestamp_t new_tx;
+    if (getenv("FAKE_RX") && tx_cnt > atoi(getenv("FAKE_RX"))) {
+      new_tx = last_tx_timestamp + params->dft_sz;
+    } else {
+      do {
+        AssertFatal(!pthread_mutex_lock(&params->txMutex), "");
+        AssertFatal(!pthread_cond_wait(&tx_trig, &params->txMutex), "");
+        new_tx = tx_timestamp & ~31;
+        AssertFatal(!pthread_mutex_unlock(&params->txMutex), "");
+      } while (last_tx_timestamp == new_tx);
+    }
+    tx_cnt++;
     if (last_tx_timestamp +  params->dft_sz != new_tx)
       LOG_D(HW, "not continuous %ld\n", new_tx - (last_tx_timestamp + params->dft_sz));
     if (abs(last_tx_timestamp - new_tx) > 1228800) {
@@ -495,7 +504,7 @@ int main(int argc, char **argv) {
   int filterBand = 40e6;
 
   openair0_config_t openair0_cfg = {
-      .duplex_mode = 0,
+      .duplex_mode = duplex_mode_TDD,
       .sample_rate = sampling_rate,
       .tx_sample_advance = 0,
       .rx_num_channels = antennas,
@@ -509,7 +518,7 @@ int main(int argc, char **argv) {
       .tx_bw = filterBand,
       .clock_source = external, // internal gpsdo external
       .time_source = internal, // internal gpsdo external
-      .sdr_addrs="addr=192.168.30.2",
+      .sdr_addrs = "addr=192.168.30.2",
       .autocal = {0},
       //! rf devices work with x bits iqs when oai have its own iq format
       //! the two following parameters are used to convert iqs
