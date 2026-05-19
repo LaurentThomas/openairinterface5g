@@ -79,8 +79,8 @@ class TSQueue {
 #define DEVICE_READ_DEFAULT "/dev/xdma0_c2h_0"
 #define NB_BLOCKS_PER_READ 8
 #define READ_BLOCK_NB_SAMPLES 2048
-#define NB_BLOCKS_PER_WRITE 8
-#define WRITE_BLOCK_NB_SAMPLES 2048
+#define NB_BLOCKS_PER_WRITE 4
+#define WRITE_BLOCK_NB_SAMPLES 2048*2
 #define PKT_HEADER_NB_SAMPLES 7
 #define PKT_FOOTER_NB_SAMPLES 1
 #define PKT_OVERHEAD_NB_SAMPLES (PKT_HEADER_NB_SAMPLES + PKT_FOOTER_NB_SAMPLES)
@@ -88,7 +88,7 @@ static const uint64_t magic_tx = 0xA5A50be3A5A5A5A5LL;
 static const uint64_t magic_rx = 0xA5A50be3A5A5A5A5LL;
 static const uint32_t magic_footer1 = 0xce11;
 static const uint32_t magic_footer2 = 0x5A;
-static const uint64_t tx_ahead = WRITE_BLOCK_NB_SAMPLES * 16;
+static const uint64_t tx_ahead = WRITE_BLOCK_NB_SAMPLES * 6;
 
 typedef struct {
   uint64_t control;
