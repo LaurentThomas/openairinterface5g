@@ -510,6 +510,7 @@ int main(int argc, char **argv) {
   openair0_config_t openair0_cfg = {
       .duplex_mode = duplex_mode_TDD,
       .sample_rate = sampling_rate,
+      .num_rb_dl=-1, // flag to say we are rftest, don't scale IQ samples for OAI
       .tx_sample_advance = 0,
       .rx_num_channels = antennas,
       .tx_num_channels = antennas,
