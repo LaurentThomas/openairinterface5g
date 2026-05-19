@@ -45,6 +45,7 @@ void set_taus_seed(unsigned int seed_init){};
 openair0_timestamp_t rx_timestamp = 0;
 openair0_timestamp_t tx_timestamp = 0;
 openair0_timestamp_t last_hole = 0;
+const int hole_size=10;
 pthread_cond_t tx_trig;
 
 static uint32_t rng_state = 2463534242u; // non-zero seed
@@ -322,7 +323,7 @@ void *write_thread(void *arg)
   openair0_timestamp_t last_tx_timestamp = 0;
   // this is tx ahead in main application, the driver has it's tx ahead that shuld be smaller to prevent starvation
   const int tx_ahead =  params->dft_sz * 20;
-  char *flag = getenv("HOLE");
+  char *hole_flag = getenv("HOLE");
   uint64_t num_samples_file=0;
   uint64_t tx_cnt = 0;
   while (!oai_exit) {
@@ -350,9 +351,10 @@ void *write_thread(void *arg)
 	for (int i=0; i< params->dft_sz; i++)
 	  samplesTx[0][i]=file_input[(num_samples_file++)%num_samples];
       }
-      c16_t tmp[25];
-      int loc=rand()%8000;
-      if (flag && count % 1935 == 0) {
+      c16_t tmp[hole_size];
+      int loc=-1;
+      if (hole_flag && count % 1935 == 0) {
+	loc=((uint)rand())%(params->dft_sz-hole_size);
 	memcpy(tmp, samplesTx[0]+loc,sizeof(tmp));
 	memset(samplesTx[0]+loc, 0,sizeof(tmp));
 	AssertFatal(!pthread_mutex_lock(&params->txMutex), "");
@@ -362,7 +364,7 @@ void *write_thread(void *arg)
       }
       params->rfdevice
           ->trx_write_func(params->rfdevice, last_tx_timestamp + tx_ahead, (void **)samplesTx, params->dft_sz, params->antennas, 0);
-      if(flag && count % 1935 == 0)
+      if(loc >= 0)
 	memcpy(samplesTx[0]+loc, tmp, sizeof(tmp));
       count++;
     } while (last_tx_timestamp < new_tx);
@@ -404,14 +406,16 @@ void *read_thread(void *arg)
     for (int i = 0; i < params->dft_sz; i++)
       params->samplesRx[0][i] = (c16_t){params->samplesRx[0][i].r >>2, params->samplesRx[0][i].i >>2};
     */
-    double min=UINT64_MAX;
+    double min=UINT64_MAX, tot_pow=0, tot_samples=0;
     int min_pos=0;
     if (getenv("HOLE")) {
-      for (int i = 0; i < params->dft_sz-25; i++) {
+      for (int i = 0; i < params->dft_sz-hole_size; i++) {
 	double local=0;
-	for (int j=i; j<i+10; j++) {
+	for (int j=i; j<i+hole_size; j++) {
 	  local+=params->samplesRx[0][j].r*params->samplesRx[0][j].r+params->samplesRx[0][j].i*params->samplesRx[0][j].i;
 	}
+	tot_samples+=hole_size;
+	tot_pow+=local;
 	if (local < min ) {
 	  min=local;
 	  min_pos=i;
@@ -420,7 +424,7 @@ void *read_thread(void *arg)
     }
     AssertFatal(!pthread_mutex_lock(&params->txMutex), "");
     tx_timestamp = rx_timestamp;
-    if (min < 1000) {
+    if (min < tot_pow/(2*tot_samples)) {
       LOG_I(HW, "found hole %lu, programmed for %lu, received %ld later\n", min_pos+rx_timestamp, last_hole,min_pos+rx_timestamp - last_hole  );
     }
     warmup++;
