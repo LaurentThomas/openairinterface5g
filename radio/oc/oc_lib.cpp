@@ -330,7 +330,7 @@ static int32_t signalEnergy(c16_t *input, uint32_t length)
 }
 
 // DC-filter: 0 will be done in FPGA after seeing 128-consecutive samples having the same value
-static inline int write_block(oc_state_t *s, c16_t *samples, uint sz)
+static inline int write_block(oc_state_t *s, c16_t *samples, uint sz, bool no_scaling)
 {
   if (!s->tx_block) {
     s->tx_block = (tx_packet_t *)malloc16(NB_BLOCKS_PER_WRITE * sizeof(tx_packet_t));
@@ -346,10 +346,12 @@ static inline int write_block(oc_state_t *s, c16_t *samples, uint sz)
                          .txGain = 0x112233,
                          .filler3 = 0xf0,
                          .ppsOffset = 0x28272625,
-                         .timestamp = (uint64_t)s->tx_ts - 170}; // WHY 170 !!!
-  // for (uint i = 0; i < sz; i++)
-  //   ant0->b[i] = (c16_t){(int16_t)(samples[i].r), (int16_t)(samples[i].i)};
-  memcpy(ant0->b, samples, sz * sizeof(c16_t));
+                         .timestamp = (uint64_t)s->tx_ts};
+  if (no_scaling)
+    memcpy(ant0->b, samples, sz * sizeof(c16_t));
+  else 
+    for (uint i = 0; i < sz; i++)
+      ant0->b[i] = (c16_t){(int16_t)(samples[i].r<<4), (int16_t)(samples[i].i<<4)};
   s->tx_ts += sz;
   s->tx_block_pos++;
   s->tx_count++;
@@ -388,7 +390,7 @@ static int oc_write(openair0_device_t *device, openair0_timestamp_t timestamp, v
     int tmp = std::min(wr_sz, WRITE_BLOCK_NB_SAMPLES);
     if (tmp != WRITE_BLOCK_NB_SAMPLES)
       LOG_E(HW, "Error block size: %d\n", nsamps);
-    int sz = write_block(s, ((c16_t *)buff[0]) + nsamps - wr_sz, tmp);
+    int sz = write_block(s, ((c16_t *)buff[0]) + nsamps - wr_sz, tmp, device->openair0_cfg->num_rb_dl == -1);
     if (sz != tmp)
       LOG_E(HW, "ask to write %d, res is %d\n", tmp, sz);
     wr_sz -= sz;
@@ -579,7 +581,7 @@ void *read_thread(void *arg)
 static int oc_read(openair0_device_t *device, openair0_timestamp_t *ptimestamp, void **buff, int nsamps, int cc)
 {
   oc_state_t *s = (oc_state_t *)device->priv;
-  static uint64_t reads_cnt = 0;
+  static int64_t reads_cnt = 0;
   if (getenv("FAKE_RX") && reads_cnt > atoi(getenv("FAKE_RX"))) {
     *ptimestamp = s->rx_ts_interface;
     s->rx_ts_interface += nsamps;
@@ -811,23 +813,23 @@ extern "C" {
       int tx_sample_advance;
       double tx_bw;
       double rx_bw;
-    } config_table[] = {{245760000, 15, 200e6, 200e6},
-			{184320000, 15, 100e6, 100e6},
-			{122880000, 15, 80e6, 80e6},
-			{92160000, 15, 60e6, 60e6},
-			{61440000, 15, 40e6, 40e6},
-			{46080000, 15, 40e6, 40e6},
-			{30720000, 15, 40e6, 40e6},
-			{23040000, 15, 20e6, 20e6},
-			{15360000, 15, 10e6, 10e6},
-			{7680000, 50, 5e6, 5e6},
-			{1920000, 50, 1.25e6, 1.25e6}};
+    } config_table[] = {{245760000, 0, 200e6, 200e6},
+			{184320000, 179, 100e6, 100e6},
+			{122880000, 179, 80e6, 80e6},
+			{92160000, 0, 60e6, 60e6},
+			{61440000, 0, 40e6, 40e6},
+			{46080000, 0, 40e6, 40e6},
+			{30720000, 0, 40e6, 40e6},
+			{23040000, 0, 20e6, 20e6},
+			{15360000, 0, 10e6, 10e6},
+			{7680000, 0, 5e6, 5e6},
+			{1920000, 0, 1.25e6, 1.25e6}};
     size_t i = 0;
     for (; i < sizeofArray(config_table); i++)
       if (config_table[i].sample_rate == (int)openair0_cfg[0].sample_rate) {
-	openair0_cfg[0].tx_sample_advance = config_table[i].tx_sample_advance;
-	openair0_cfg[0].tx_bw = config_table[i].tx_bw;
-	openair0_cfg[0].rx_bw = config_table[i].rx_bw;
+	device->openair0_cfg->tx_sample_advance = config_table[i].tx_sample_advance;
+	device->openair0_cfg->tx_bw = config_table[i].tx_bw;
+	device->openair0_cfg->rx_bw = config_table[i].rx_bw;
 	break;
       }
     if (i == sizeofArray(config_table)) {
