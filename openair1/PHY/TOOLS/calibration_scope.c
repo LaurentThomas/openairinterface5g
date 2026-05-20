@@ -1,11 +1,7 @@
-/*
- * SPDX-License-Identifier: LicenseRef-CSSL-1.0
- */
-
 #include <stdlib.h>
-#include "common/utils/system.h"
-#include "common/utils/utils.h"
-#include "common/utils/LOG/log.h"
+#include <common/utils/LOG/log.h>
+#include <common/utils/system.h>
+#include <openair1/PHY/impl_defs_top.h>
 #include "executables/softmodem-common.h"
 #include "executables/nr-softmodem-common.h"
 #include <forms.h>
@@ -283,21 +279,28 @@ static void spectrum(OAIgraph_t *graph, OAI_phy_scope_t *scope)
 
 static void zoomIn(OAIgraph_t *graph,  OAI_phy_scope_t *scope)
 {
+  /*
   static time_t t = 0;
   time_t n = time(NULL);
-  //if (n == t)
-  //return;
+  if (n == t)
+    return;
   t = n;
-  int len = scope->context->dft_sz;
-  int detailLen = min(len, 750);
-  int beg=0; max(0, rand()%len - detailLen )/2*2;
+  */
+  //int len = scope->context->dft_sz;
+  int detailLen = 750; //min(len, 1024);
+  //int beg=5500; max(0, rand()%len - detailLen )/2*2;
   for (int ri = 0; ri < 2; ri++) {
     float *values;
     float *time;
     oai_xygraph_getbuff(graph, &time, &values, detailLen, ri);
-    for (int i = 0; i < detailLen; i++)
-      values[i] = ri ? scope->timeDomain[beg+i].i : scope->timeDomain[beg+i].r;
-    oai_xygraph(graph, time, values, detailLen, ri, 10);
+    memset(values,0,sizeof(*values)*detailLen);
+    float *v=values;
+    //for (int j=2048*3-95; j < len-detailLen; j+=2048) {
+    int j=0;
+      for (int i = 0; i < detailLen; i++)
+	*v++ = ri ? scope->timeDomain[j+i].i : scope->timeDomain[j+i].r;
+      //}
+    oai_xygraph(graph,time, values, detailLen, ri, 10);
   }
 }
 
@@ -357,32 +360,31 @@ static OAI_phy_scope_t *createScopeCalibration(threads_t *context)
   OAI_phy_scope_t *fdui = calloc_or_fail((sizeof *fdui), 1);
   fdui->context=context;
   // Define form
-  fdui->phy_scope = fl_bgn_form(FL_NO_BOX, 1200, 800);
+  fdui->phy_scope = fl_bgn_form( FL_NO_BOX, 1200, 800 );
   // This the whole UI box
-  obj = fl_add_box(FL_BORDER_BOX, 0, 0, 1200, 800, "");
+  obj = fl_add_box( FL_BORDER_BOX, 0, 0, 1200, 800, "" );
   fl_set_object_color( obj, FL_BLACK, FL_WHITE );
   int curY=0,x,y,w,h;
-  
+
   OAIgraph_t *graph = fdui->graph;
   // Received signal
   *graph++ = calibrationCommonGraph(zoomIn, FL_NORMAL_XYPLOT, 0, curY, 1200, 100, "Received Signal in time zoom", FL_RED);
   fl_get_object_bbox(fdui->graph[0].graph,&x, &y,&w, &h);
    curY += h + 20;
   // frequency spectrum
-   *graph++ = calibrationCommonGraph(spectrum, FL_NORMAL_XYPLOT, 0, curY, 1200, 100, "DFT output", FL_YELLOW);
-   fl_get_object_bbox(fdui->graph[1].graph, &x, &y, &w, &h);
-   curY += h + 20;
-   // Frequency-domain channel response
-   *graph++ = calibrationCommonGraph(gNBWaterFall, WATERFALL, 0, curY, 1200, 100, "received signal in time", FL_RED);
-   fl_get_object_bbox(fdui->graph[2].graph, &x, &y, &w, &h);
-   curY += h + 20;
-   *graph++ = calibrationCommonGraph(signalIQ, FL_POINTS_XYPLOT, 0, curY, 300, 300, "I/Q of frequency domain", FL_YELLOW);
-   *graph++ =
-       calibrationCommonGraph(signalIQtx, FL_POINTS_XYPLOT, 500, curY, 300, 300, "Tx generated I/Q of frequency domain", FL_YELLOW);
-   fl_end_form();
-   fdui->phy_scope->fdui = fdui;
-   fl_show_form(fdui->phy_scope, FL_PLACE_HOTSPOT, FL_FULLBORDER, "calibration SCOPE");
-   return fdui;
+  *graph++ = calibrationCommonGraph(spectrum, FL_NORMAL_XYPLOT, 0, curY, 1200, 100, "DFT output", FL_YELLOW);
+  fl_get_object_bbox(fdui->graph[1].graph,&x, &y,&w, &h);
+  curY += h + 20;
+  // Frequency-domain channel response
+  *graph++ = calibrationCommonGraph(gNBWaterFall, WATERFALL, 0, curY, 1200, 100, "received signal in time", FL_RED);
+  fl_get_object_bbox(fdui->graph[2].graph, &x, &y, &w, &h);
+  curY+=h+20;
+  *graph++ = calibrationCommonGraph(signalIQ, FL_POINTS_XYPLOT, 0, curY, 300, 300, "I/Q of frequency domain", FL_YELLOW);
+  *graph++ = calibrationCommonGraph(signalIQtx, FL_POINTS_XYPLOT, 500, curY, 300, 300, "Tx generated I/Q of frequency domain", FL_YELLOW);
+  fl_end_form( );
+  fdui->phy_scope->fdui = fdui;
+  fl_show_form(fdui->phy_scope, FL_PLACE_HOTSPOT, FL_FULLBORDER, "calibration SCOPE");
+  return fdui;
 }
 
 void calibrationScope(OAI_phy_scope_t  *form) {

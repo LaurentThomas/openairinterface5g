@@ -329,9 +329,20 @@ static int32_t signalEnergy(c16_t *input, uint32_t length)
   return (uint32_t)((sums[0] + sums[1] + sums[2] + sums[3] + leftover_sum) / (float)length);
 }
 
+#define BURST_NUM_OF_PACKETS (256u)
 // DC-filter: 0 will be done in FPGA after seeing 128-consecutive samples having the same value
 static inline int write_block(oc_state_t *s, c16_t *samples, uint sz, bool no_scaling)
 {
+  // TO BE REWRITTEN BY LAURENT THOMAS
+  static uint stream_seqId = 0x01;
+  if (BURST_NUM_OF_PACKETS == 1) {
+    stream_seqId = 0x01;  // Start of Burst all the time
+  } else if (((s->tx_count) % BURST_NUM_OF_PACKETS) == 0) {
+    stream_seqId = 0x01;  // Start of Burst
+  } else {
+    stream_seqId = 0x02;  // Middle of Burst 
+  }
+  
   if (!s->tx_block) {
     s->tx_block = (tx_packet_t *)malloc16(NB_BLOCKS_PER_WRITE * sizeof(tx_packet_t));
   }
@@ -339,7 +350,7 @@ static inline int write_block(oc_state_t *s, c16_t *samples, uint sz, bool no_sc
   ant0->h = (headerTx_t){.control = magic_tx,
                          .packetSeqNum = s->txSeq++,
                          .packetSz = WRITE_BLOCK_NB_SAMPLES,
-                         .seqId = 1,
+                         .seqId = stream_seqId,
                          .filler = 0x02,
                          .markers = 0xb1,
                          .filler2 = 0xabcd,
@@ -473,12 +484,16 @@ static bool get_blocks(oc_state_t *s, rx_packet_t *p)
   tot_samples+= NB_BLOCKS_PER_READ * READ_BLOCK_NB_SAMPLES;
   if (now.tv_sec != last_second.tv_sec) {
     LOG_I(HW,
-          "driver avg read rate:%f\n errors during last second: txLate %u, txSeqerr %u, timerOverflow %u, atomicPacket %u, present "
+	  "driver avg read rate:%f\n errors during last second: %s %u, %s %u, %s %u, %s %u, present "
           "tx seq %u\n\n ",
           (float)tot_samples / (now.tv_sec * 1000000 - origin.tv_sec * 1000000 + now.tv_nsec / 1000.0 - origin.tv_nsec / 1000.0),
-          s->txLate,
+	  s->txLate?"\x1B[93m""txLate""\x1B[0m":"txLate",
+	  s->txLate,
+	  s->txErr?"\x1B[93m""txSeqerr""\x1B[0m":"txSeqerr",
           s->txErr,
+	  s->timerOverflow?"\x1B[93m""timerOverflow""\x1B[0m":"timerOverflow",
           s->timerOverflow,
+	  s->atomicPacket?"\x1B[93m""atomicPacket""\x1B[0m":"atomicPacket",
           s->atomicPacket,
           s->txSeq);
     s->txLate = s->txErr = s->timerOverflow = s->atomicPacket = 0;

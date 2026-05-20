@@ -255,7 +255,7 @@ void *write_thread(void *arg)
     } break;
     case e_QAM_256: {
       __attribute__((aligned(32))) c16_t freq_signal[params->dft_sz] = {};
-      const float required_BW = 4000.0e3;
+      const float required_BW = 6000.0e3;
       const float dft_binsize = ((float)122.88e6 / (float)params->dft_sz);
       int center = dft_binsize / 2;
       float sqrt42 = 0.15430;
@@ -287,8 +287,8 @@ void *write_thread(void *arg)
         samplesTx[0][i].i = WAVE_AMP * sin((ts * M_PI * 2 * sin_freq) / 122880000); // samplesTx[0][i].r;
         // Hamming Window - to allow some pseudo-continuity between batches as this is not a continuously generated signal as in
         // real life samplesTx[0][i].r = (samplesTx[0][i].r) * (0.54 - 0.46 * cos(2 * M_PI * i / (params->dft_sz-1)));
-        // samplesTx[0][i].i = (samplesTx[0][i].i) * (0.54 - 0.46 * cos(2 * M_PI * i / (params->dft_sz-1)));
-        // samplesTx[0][i].r = (samplesTx[0][i].r) * (0.54 - 0.46 * cos(2 * M_PI * i / (params->dft_sz-1)));
+	//         samplesTx[0][i].i = (samplesTx[0][i].i) * (0.54 - 0.46 * cos(2 * M_PI * i / (params->dft_sz-1)));
+	//         samplesTx[0][i].r = (samplesTx[0][i].r) * (0.54 - 0.46 * cos(2 * M_PI * i / (params->dft_sz-1)));
         ts++;
       }
       break;
