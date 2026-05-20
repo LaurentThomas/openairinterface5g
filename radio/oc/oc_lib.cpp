@@ -86,8 +86,8 @@ static const uint32_t magic_footer2 = 0x5A;
 #define READ_BLOCK_NB_SAMPLES 2048
 #define NB_BLOCKS_PER_READ 8
 
-#define WRITE_BLOCK_NB_SAMPLES 2048 * 4
-#define NB_BLOCKS_PER_WRITE 2
+#define WRITE_BLOCK_NB_SAMPLES 2048 * 3
+#define NB_BLOCKS_PER_WRITE 3
 static const uint64_t tx_ahead = WRITE_BLOCK_NB_SAMPLES * NB_BLOCKS_PER_WRITE * 3;
 
 typedef struct {
@@ -190,7 +190,8 @@ typedef struct {
   uint txSeq;
   uint64_t gap;
   tx_packet_t *tx_block;
-  size_t tx_block_pos;
+  uint8_t *tx_block_pos;
+  uint tx_block_num;
   TSQueue<tx_packet_t *> *ready_tx;
   TSQueue<uint64_t> *last_rx;
   TSQueue<rx_packet_t *> *read_queue;
@@ -254,22 +255,24 @@ void *write_thread(void *arg)
 	printf("ERROROROROROO\n");
       ts=p[i].h.timestamp+WRITE_BLOCK_NB_SAMPLES;
       }*/
-    struct timespec b,e;
+    struct timespec b, e;
     clock_gettime(CLOCK_REALTIME,&b);
-    if (s->continuous_tx)
-      for (tx_packet_t *j = p; j < p + NB_BLOCKS_PER_WRITE; j++) {
-        if (ts != j->h.timestamp)
-          LOG_E(HW, "tx is not contiguous\n");
-        ts = j->h.timestamp + j->h.packetSz;
-      }
-
-    size_t wrote = write(s->fd_write, p, sizeof(tx_packet_t) * NB_BLOCKS_PER_WRITE);
+    uint8_t *j = (uint8_t *)p;
+    for (int i = 0; i < NB_BLOCKS_PER_WRITE; i++) {
+      tx_packet_t *cur = (tx_packet_t *)j;
+      if (ts != cur->h.timestamp && s->continuous_tx)
+        LOG_E(HW, "tx is not contiguous\n");
+      ts = cur->h.timestamp + cur->h.packetSz;
+      j += sizeof(headerTx_t) + cur->h.packetSz * sizeof(*cur->b);
+    }
+    uint sz_bytes = j - (uint8_t *)p;
+    size_t wrote = write(s->fd_write, p, sz_bytes);
     clock_gettime(CLOCK_REALTIME,&e);
-    if (wrote != sizeof(tx_packet_t) * NB_BLOCKS_PER_WRITE)
-      LOG_E(HW, "write to SDR failed, request: %lu, wrote %ld\n", sizeof(tx_packet_t) * NB_BLOCKS_PER_WRITE, wrote);
+    if (wrote != sz_bytes)
+      LOG_E(HW, "write to SDR failed, request: %u, wrote %ld\n", sz_bytes, wrote);
     if (wrote < 0)
       LOG_E(HW, "write to %s failed, errno %d:%s\n", s->filename_write, errno, strerror(errno));
-    LOG_D(HW, "wrote: %lu\n", p->h.timestamp);
+    LOG_D(HW, "wrote: for ts %lu, total size: %u\n", p->h.timestamp, sz_bytes);
     if (log_headers) {
       char str[60];
       memset(str,' ', sizeof(str));
@@ -345,11 +348,13 @@ static inline int write_block(oc_state_t *s, c16_t *samples, uint sz, bool no_sc
   
   if (!s->tx_block) {
     s->tx_block = (tx_packet_t *)malloc16(NB_BLOCKS_PER_WRITE * sizeof(tx_packet_t));
+    s->tx_block_pos = (uint8_t *)s->tx_block;
   }
-  tx_packet_t *ant0 = s->tx_block + s->tx_block_pos;
+  LOG_I(HW, "add tx packet for %u samples, ts %lu\n", sz, s->tx_ts);
+  tx_packet_t *ant0 = (tx_packet_t *)s->tx_block_pos;
   ant0->h = (headerTx_t){.control = magic_tx,
                          .packetSeqNum = s->txSeq++,
-                         .packetSz = WRITE_BLOCK_NB_SAMPLES,
+                         .packetSz = sz,
                          .seqId = stream_seqId,
                          .filler = 0x02,
                          .markers = 0xb1,
@@ -364,11 +369,13 @@ static inline int write_block(oc_state_t *s, c16_t *samples, uint sz, bool no_sc
     for (uint i = 0; i < sz; i++)
       ant0->b[i] = (c16_t){(int16_t)(samples[i].r<<4), (int16_t)(samples[i].i<<4)};
   s->tx_ts += sz;
-  s->tx_block_pos++;
+  s->tx_block_pos += sizeof(headerTx_t) + sz * sizeof(*ant0->b);
+  s->tx_block_num++;
   s->tx_count++;
-  if (s->tx_block_pos == NB_BLOCKS_PER_WRITE) {
+  if (s->tx_block_num == NB_BLOCKS_PER_WRITE) {
     s->ready_tx->push(s->tx_block);
-    s->tx_block_pos = 0;
+    s->tx_block_num = 0;
+    s->tx_block_pos = NULL;
     s->tx_block = NULL;
   }
   return sz;
@@ -399,17 +406,17 @@ static int oc_write(openair0_device_t *device, openair0_timestamp_t timestamp, v
   // LOG_E(HW, "ask to write %d\n", wr_sz);
   while (wr_sz > 0) {
     int tmp = std::min(wr_sz, WRITE_BLOCK_NB_SAMPLES);
-    if (tmp != WRITE_BLOCK_NB_SAMPLES)
-      LOG_E(HW, "Error block size: %d\n", nsamps);
     int sz = write_block(s, ((c16_t *)buff[0]) + nsamps - wr_sz, tmp, device->openair0_cfg->num_rb_dl == -1);
     if (sz != tmp)
       LOG_E(HW, "ask to write %d, res is %d\n", tmp, sz);
     wr_sz -= sz;
   }
+
   if (s->tx_ts != timestamp + nsamps)
     LOG_E(HW,"tx samples count error\n");
   s->tx_ts = timestamp + nsamps;
-  #if 0
+
+#if 0
   static uint nsamps0 = 0;
   struct energy_s e = compute_papr_db((c16_t *)*buff, nsamps);
   if (e.mean > 1) {
@@ -418,7 +425,8 @@ static int oc_write(openair0_device_t *device, openair0_timestamp_t timestamp, v
   } else {
     nsamps0 += nsamps;
   }
-  #endif
+#endif
+
   return nsamps;
 }
 
