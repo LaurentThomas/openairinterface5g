@@ -77,18 +77,18 @@ class TSQueue {
 
 #define DEVICE_WRITE_DEFAULT "/dev/xdma0_h2c_0"
 #define DEVICE_READ_DEFAULT "/dev/xdma0_c2h_0"
-#define NB_BLOCKS_PER_READ 8
-#define READ_BLOCK_NB_SAMPLES 2048
-#define NB_BLOCKS_PER_WRITE 4
-#define WRITE_BLOCK_NB_SAMPLES 2048*2
-#define PKT_HEADER_NB_SAMPLES 7
-#define PKT_FOOTER_NB_SAMPLES 1
-#define PKT_OVERHEAD_NB_SAMPLES (PKT_HEADER_NB_SAMPLES + PKT_FOOTER_NB_SAMPLES)
+
 static const uint64_t magic_tx = 0xA5A50be3A5A5A5A5LL;
 static const uint64_t magic_rx = 0xA5A50be3A5A5A5A5LL;
 static const uint32_t magic_footer1 = 0xce11;
 static const uint32_t magic_footer2 = 0x5A;
-static const uint64_t tx_ahead = WRITE_BLOCK_NB_SAMPLES * 6;
+
+#define READ_BLOCK_NB_SAMPLES 2048
+#define NB_BLOCKS_PER_READ 8
+
+#define WRITE_BLOCK_NB_SAMPLES 2048 * 4
+#define NB_BLOCKS_PER_WRITE 2
+static const uint64_t tx_ahead = WRITE_BLOCK_NB_SAMPLES * NB_BLOCKS_PER_WRITE * 3;
 
 typedef struct {
   uint64_t control;
@@ -148,7 +148,7 @@ static inline void dumpHD(std::string ctx, headerRx_t h)
 {
   printf("header dump, %s\n", ctx.c_str());
   uint8_t *z = (uint8_t *)&h;
-  for (int i = 0; i < PKT_HEADER_NB_SAMPLES; i++)
+  for (uint i = 0; i < sizeof(headerRx_t); i++)
     printf("  %02x:%02x %02x:%02x\n", z[i * 4 + 0], z[i * 4 + 1], z[i * 4 + 2], z[i * 4 + 3]);
   printf(
 	 "decoded magic: %lx\n"
@@ -231,8 +231,8 @@ void *write_thread(void *arg)
   FILE* fd=fopen("/tmp/headers", "w");
   fprintf(fd,"time before call xdma, nano sec in xdma write, packet seq num, timestamp\n");
   char * log_headers=getenv("LOGHEADERS");
-  tx_packet_t ref;
-  int seq=0;
+  // tx_packet_t ref;
+  // int seq=0;
   uint64_t ts = 0;
   do {
     tx_packet_t *p = s->ready_tx->pop();
@@ -424,9 +424,7 @@ static int oc_write(openair0_device_t *device, openair0_timestamp_t timestamp, v
 
 static void initial_block_align (oc_state_t *s) {
   LOG_I(HW, "Synchronizing rx\n");
-  __attribute__ ((aligned(32))) uint32_t b[READ_BLOCK_NB_SAMPLES + PKT_OVERHEAD_NB_SAMPLES];
-  int idx = 0;
-  int old = 0;
+  __attribute__((aligned(32))) uint32_t b[sizeof(rx_packet_t)];
   uint64_t bytes = 0;
   //while (1) {
   ssize_t ret = read(s->fd_read, b, sizeof(b));
@@ -435,21 +433,16 @@ static void initial_block_align (oc_state_t *s) {
     usleep(10000);
     return;
   }
-  int i;
+  uint i;
   headerRx_t *rx = NULL;
-  for (i = 0; i < READ_BLOCK_NB_SAMPLES + PKT_HEADER_NB_SAMPLES; i++)
+  for (i = 0; i < sizeof(b) / sizeof(*b) - sizeof(headerRx_t); i++)
     if (b[i] == (magic_rx & UINT32_MAX) && b[i + 1] == ((magic_rx >> 32) & UINT32_MAX)) {
-      LOG_D(HW,
-            "found first magic at %d (inblock: %d), dist: %d, bytes %lu\n",
-            idx * (READ_BLOCK_NB_SAMPLES + PKT_OVERHEAD_NB_SAMPLES) + i,
-            i,
-            idx * (READ_BLOCK_NB_SAMPLES + PKT_OVERHEAD_NB_SAMPLES) + i - old,
-            bytes);
+      LOG_D(HW, "found first magic at %d \n", i);
       rx = (headerRx_t *)(b + i);
       dumpHD("first header:", *rx);
       break;
     }
-  if (i == (READ_BLOCK_NB_SAMPLES + PKT_HEADER_NB_SAMPLES)) {
+  if (i == (sizeof(b) / sizeof(*b) - sizeof(headerRx_t))) {
     LOG_E(HW, "%%error magic not found\n");
     return;
   }
@@ -481,7 +474,7 @@ static bool get_blocks(oc_state_t *s, rx_packet_t *p)
     last_second=now;
     origin=now;
   }
-  tot_samples+= NB_BLOCKS_PER_READ * READ_BLOCK_NB_SAMPLES;
+  tot_samples += s->nb_blocks_per_read * sizeof(p->b) / sizeof(*p->b);
   if (now.tv_sec != last_second.tv_sec) {
     LOG_I(HW,
 	  "driver avg read rate:%f\n errors during last second: %s %u, %s %u, %s %u, %s %u, present "
@@ -510,7 +503,7 @@ static bool get_blocks(oc_state_t *s, rx_packet_t *p)
             s->seqNum,
             (~p[i].f.atomicPacket & 0x01),
             p[i].f.timerOverflow);
-    s->rx_timestamp=p[i].h.timestamp + READ_BLOCK_NB_SAMPLES;
+    s->rx_timestamp = p[i].h.timestamp + p[i].h.packetSz;
     /*
     if (llabs((int64_t)s->lastPpsOffset - (int64_t)p[i].h.ppsOffset) > 12)
       // pps_in is based on a real pulse from the GPS. It may have some jitter and drift during time.
