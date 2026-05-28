@@ -9,6 +9,7 @@
 #include <queue>
 #include <condition_variable>
 #include <mutex>
+#include <atomic>
 
 #include <string.h>
 #include <pthread.h>
@@ -84,11 +85,11 @@ static const uint32_t magic_footer1 = 0xce11;
 static const uint32_t magic_footer2 = 0x5A;
 
 #define READ_BLOCK_NB_SAMPLES 2048
-#define NB_BLOCKS_PER_READ 8
+#define NB_BLOCKS_PER_READ 4
 
-#define WRITE_BLOCK_NB_SAMPLES 2048 * 3
-#define NB_BLOCKS_PER_WRITE 3
-static const uint64_t tx_ahead = WRITE_BLOCK_NB_SAMPLES * NB_BLOCKS_PER_WRITE * 3;
+#define WRITE_BLOCK_NB_SAMPLES 2048 * 4
+#define NB_BLOCKS_PER_WRITE 2
+static const uint64_t tx_ahead = WRITE_BLOCK_NB_SAMPLES * 4;
 
 typedef struct {
   uint64_t control;
@@ -109,10 +110,10 @@ typedef struct {
   uint16_t packetSeqNum;
   uint16_t packetSz;
   uint8_t RXen     : 1;
-  uint8_t TXen     : 1;
-  uint8_t PLLlocked: 1;
+  uint8_t TXen: 1;
   uint8_t ADCsync  : 1;
   uint8_t DACsync  : 1;
+  uint8_t TXhfull: 1;
   uint8_t TXlate   : 1;
   uint8_t TXseqerr : 1;
   uint8_t filler   : 1;
@@ -151,62 +152,66 @@ static inline void dumpHD(std::string ctx, headerRx_t h)
   for (uint i = 0; i < sizeof(headerRx_t); i++)
     printf("  %02x:%02x %02x:%02x\n", z[i * 4 + 0], z[i * 4 + 1], z[i * 4 + 2], z[i * 4 + 3]);
   printf(
-	 "decoded magic: %lx\n"
-	 "   dataSz(words): %u, packetSeq:%u\n"
-	 "   InbandReadValue %x, InbandReadAddr:%x, DACsync %u, ADCsync: %u, PLLlocked:%u, TXen:%u, RXen:%u\n"
-	 "   gpslocked %d, ppsalive %d, pps offset %d\n"
-	 "   timestamp: %lu\n",
-	 h.control,
-	 h.packetSz,
-	 h.packetSeqNum,
-	 h.InbandReadValue,
-	 h.InbandReadAddr,
-	 h.DACsync,
-	 h.ADCsync,
-	 h.PLLlocked,
-	 h.TXen,
-	 h.RXen,
-	 h.gpsLock,
-	 h.ppsAlive,
-	 h.ppsOffset,
-	 h.timestamp);
+      "decoded magic: %lx\n"
+      "   dataSz(words): %u, packetSeq:%u\n"
+      "   InbandReadValue %x, InbandReadAddr:%x, TXhfull %u, DACsync %u, ADCsync: %u, TXen:%u, RXen:%u\n"
+      "   gpslocked %d, ppsalive %d, pps offset %d\n"
+      "   timestamp: %lu\n",
+      h.control,
+      h.packetSz,
+      h.packetSeqNum,
+      h.InbandReadValue,
+      h.InbandReadAddr,
+      h.TXhfull,
+      h.DACsync,
+      h.ADCsync,
+      h.TXen,
+      h.RXen,
+      h.gpsLock,
+      h.ppsAlive,
+      h.ppsOffset,
+      h.timestamp);
 }
 
 typedef struct {
-  char filename_write[FILENAME_MAX];
-  char filename_read[FILENAME_MAX];
   int fd_write;
-  int fd_read;
-  int num_underflows;
-  int num_overflows;
-  int num_seq_errors;
+  bool first_tx;
+  bool continuous_tx;
   int64_t tx_count;
-  int64_t rx_count;
-  int wait_for_first_pps;
-  int use_gps;
-  openair0_timestamp_t rx_timestamp;
-  openair0_timestamp_t rx_ts_interface;
   openair0_timestamp_t tx_ts;
   uint txSeq;
-  uint64_t gap;
   tx_packet_t *tx_block;
   uint8_t *tx_block_pos;
   uint tx_block_num;
   TSQueue<tx_packet_t *> *ready_tx;
-  TSQueue<uint64_t> *last_rx;
-  TSQueue<rx_packet_t *> *read_queue;
-  bool first_tx;
-  bool rxMagicFound;
-  uint seqNum;
-  uint lastPpsOffset;
+} tx_thr_t;
+
+typedef struct {
+  int fd_read;
   int  nb_blocks_per_read;
+  openair0_timestamp_t rx_timestamp;
+  openair0_timestamp_t rx_ts_interface;
+  int64_t rx_count;
+  uint lastPpsOffset;
   int remain_samples;
-  rx_packet_t *rx_live;
+  uint64_t gap;
+  uint timerOverflow;
+  uint seqNum;
   uint txLate;
   uint txErr;
-  uint timerOverflow;
   uint atomicPacket;
-  bool continuous_tx;
+  TSQueue<rx_packet_t *> *read_queue;
+  rx_packet_t *rx_live;
+} rx_thr_t;
+
+typedef struct {
+  char filename_write[FILENAME_MAX];
+  char filename_read[FILENAME_MAX];
+  int wait_for_first_pps;
+  rx_thr_t rx;
+  tx_thr_t tx;
+  std::atomic<bool> txHfull;
+  TSQueue<uint64_t> *last_rx;
 } oc_state_t;
 
 typedef struct {
@@ -225,26 +230,35 @@ static int sync_to_gps(openair0_device_t *device)
   return 0;
 }
 
+// INSTEAD OF TIMESTAMP AHEAD you need to READ the TXhfull flag from the RX packet header
+// IF TXhfull FLAG = 0 then you can write 4 packets of 8192 samples ELSE You cannot
 void *write_thread(void *arg)
 {
   oc_state_t *s = (oc_state_t *)arg;
-  uint64_t last_rx = s->last_rx->pop();
   FILE* fd=fopen("/tmp/headers", "w");
   fprintf(fd,"time before call xdma, nano sec in xdma write, packet seq num, timestamp\n");
   char * log_headers=getenv("LOGHEADERS");
   // tx_packet_t ref;
   // int seq=0;
   uint64_t ts = 0;
+  tx_thr_t *tx = &s->tx;
+  bool do_rx = getenv("FAKE_RX") == NULL;
   do {
-    tx_packet_t *p = s->ready_tx->pop();
-    if (!getenv("FAKE_RX")) {
-      if (last_rx + tx_ahead < p->h.timestamp)
-        LOG_D(HW, "tx is too ahead, waiting, %lu, %ld\n", p->h.timestamp, p->h.timestamp - last_rx);
-      while (last_rx + tx_ahead < p->h.timestamp) {
-        last_rx = s->last_rx->pop();
-        LOG_D(HW, "pop rx: %lu, rx q sz %lu, tx q sz %lu\n", last_rx, s->last_rx->m_queue.size(), s->ready_tx->m_queue.size());
-      }
-    }
+    tx_packet_t *p = tx->ready_tx->pop();
+    if (do_rx && s->txHfull) {
+      do {
+        struct timespec b, e;
+        clock_gettime(CLOCK_REALTIME, &b);
+        uint64_t last_rx = s->last_rx->pop();
+        clock_gettime(CLOCK_REALTIME, &e);
+        LOG_D(HW,
+              "tx buffer was half full, blocked for %ld ns, rx ts: %lu, tx t: %lu\n",
+              (e.tv_sec - b.tv_sec) * 1000 * 1000 * 1000 + e.tv_nsec - b.tv_nsec,
+              last_rx,
+              p->h.timestamp);
+      } while (s->txHfull);
+    } else
+      LOG_D(HW, "no need to wait tx ts: %lu\n", p->h.timestamp);
     /*
     // this is test code to repeat same packet forever with continuous tested timestamp
     if (!seq)
@@ -260,13 +274,13 @@ void *write_thread(void *arg)
     uint8_t *j = (uint8_t *)p;
     for (int i = 0; i < NB_BLOCKS_PER_WRITE; i++) {
       tx_packet_t *cur = (tx_packet_t *)j;
-      if (ts != cur->h.timestamp && s->continuous_tx)
+      if (ts != cur->h.timestamp && tx->continuous_tx)
         LOG_E(HW, "tx is not contiguous\n");
       ts = cur->h.timestamp + cur->h.packetSz;
       j += sizeof(headerTx_t) + cur->h.packetSz * sizeof(*cur->b);
     }
     uint sz_bytes = j - (uint8_t *)p;
-    size_t wrote = write(s->fd_write, p, sz_bytes);
+    size_t wrote = write(tx->fd_write, p, sz_bytes);
     clock_gettime(CLOCK_REALTIME,&e);
     if (wrote != sz_bytes)
       LOG_E(HW, "write to SDR failed, request: %u, wrote %ld\n", sz_bytes, wrote);
@@ -332,28 +346,28 @@ static int32_t signalEnergy(c16_t *input, uint32_t length)
   return (uint32_t)((sums[0] + sums[1] + sums[2] + sums[3] + leftover_sum) / (float)length);
 }
 
-#define BURST_NUM_OF_PACKETS (256u)
+#define BURST_NUM_OF_PACKETS (8192u)
 // DC-filter: 0 will be done in FPGA after seeing 128-consecutive samples having the same value
-static inline int write_block(oc_state_t *s, c16_t *samples, uint sz, bool no_scaling)
+static inline int write_block(tx_thr_t *tx, c16_t *samples, uint sz, bool no_scaling)
 {
   // TO BE REWRITTEN BY LAURENT THOMAS
   static uint stream_seqId = 0x01;
   if (BURST_NUM_OF_PACKETS == 1) {
     stream_seqId = 0x01;  // Start of Burst all the time
-  } else if (((s->tx_count) % BURST_NUM_OF_PACKETS) == 0) {
+  } else if (((tx->tx_count) % BURST_NUM_OF_PACKETS) == 0) {
     stream_seqId = 0x01;  // Start of Burst
   } else {
-    stream_seqId = 0x02;  // Middle of Burst 
+    stream_seqId = 0x02; // Middle of Burst
   }
-  
-  if (!s->tx_block) {
-    s->tx_block = (tx_packet_t *)malloc16(NB_BLOCKS_PER_WRITE * sizeof(tx_packet_t));
-    s->tx_block_pos = (uint8_t *)s->tx_block;
+
+  if (!tx->tx_block) {
+    tx->tx_block = (tx_packet_t *)malloc16(NB_BLOCKS_PER_WRITE * sizeof(tx_packet_t));
+    tx->tx_block_pos = (uint8_t *)tx->tx_block;
   }
-  LOG_I(HW, "add tx packet for %u samples, ts %lu\n", sz, s->tx_ts);
-  tx_packet_t *ant0 = (tx_packet_t *)s->tx_block_pos;
+  // LOG_I(HW, "add tx packet for %u samples, ts %lu\n", sz,tx->tx_ts);
+  tx_packet_t *ant0 = (tx_packet_t *)tx->tx_block_pos;
   ant0->h = (headerTx_t){.control = magic_tx,
-                         .packetSeqNum = s->txSeq++,
+                         .packetSeqNum = tx->txSeq++,
                          .packetSz = sz,
                          .seqId = stream_seqId,
                          .filler = 0x02,
@@ -362,36 +376,37 @@ static inline int write_block(oc_state_t *s, c16_t *samples, uint sz, bool no_sc
                          .txGain = 0x112233,
                          .filler3 = 0xf0,
                          .ppsOffset = 0x28272625,
-                         .timestamp = (uint64_t)s->tx_ts};
+                         .timestamp = (uint64_t)tx->tx_ts};
   if (no_scaling)
     memcpy(ant0->b, samples, sz * sizeof(c16_t));
   else 
     for (uint i = 0; i < sz; i++)
       ant0->b[i] = (c16_t){(int16_t)(samples[i].r<<4), (int16_t)(samples[i].i<<4)};
-  s->tx_ts += sz;
-  s->tx_block_pos += sizeof(headerTx_t) + sz * sizeof(*ant0->b);
-  s->tx_block_num++;
-  s->tx_count++;
-  if (s->tx_block_num == NB_BLOCKS_PER_WRITE) {
-    s->ready_tx->push(s->tx_block);
-    s->tx_block_num = 0;
-    s->tx_block_pos = NULL;
-    s->tx_block = NULL;
+  tx->tx_ts += sz;
+  tx->tx_block_pos += sizeof(headerTx_t) + sz * sizeof(*ant0->b);
+  tx->tx_block_num++;
+  tx->tx_count++;
+  if (tx->tx_block_num == NB_BLOCKS_PER_WRITE) {
+    tx->ready_tx->push(tx->tx_block);
+    tx->tx_block_num = 0;
+    tx->tx_block_pos = NULL;
+    tx->tx_block = NULL;
   }
   return sz;
 }
 
 static int oc_write(openair0_device_t *device, openair0_timestamp_t timestamp, void **buff, int nsamps, int cc, int flags)
 {
-  oc_state_t *s = (oc_state_t *)device->priv;
+  tx_thr_t *tx = &((oc_state_t *)device->priv)->tx;
+
   timestamp -= device->openair0_cfg->command_line_sample_advance + device->openair0_cfg->tx_sample_advance;
 
-  if (s->first_tx) {
-    s->tx_ts = timestamp;
-    s->first_tx = false;
+  if (tx->first_tx) {
+    tx->tx_ts = timestamp;
+    tx->first_tx = false;
   }
 
-  int64_t gap = timestamp - s->tx_ts;
+  int64_t gap = timestamp - tx->tx_ts;
   if (gap < 0) {
     LOG_E(HW, "out of sequence\n");
     gap = 0;
@@ -406,15 +421,15 @@ static int oc_write(openair0_device_t *device, openair0_timestamp_t timestamp, v
   // LOG_E(HW, "ask to write %d\n", wr_sz);
   while (wr_sz > 0) {
     int tmp = std::min(wr_sz, WRITE_BLOCK_NB_SAMPLES);
-    int sz = write_block(s, ((c16_t *)buff[0]) + nsamps - wr_sz, tmp, device->openair0_cfg->num_rb_dl == -1);
+    int sz = write_block(tx, ((c16_t *)buff[0]) + nsamps - wr_sz, tmp, device->openair0_cfg->num_rb_dl == -1);
     if (sz != tmp)
       LOG_E(HW, "ask to write %d, res is %d\n", tmp, sz);
     wr_sz -= sz;
   }
 
-  if (s->tx_ts != timestamp + nsamps)
+  if (tx->tx_ts != timestamp + nsamps)
     LOG_E(HW,"tx samples count error\n");
-  s->tx_ts = timestamp + nsamps;
+  tx->tx_ts = timestamp + nsamps;
 
 #if 0
   static uint nsamps0 = 0;
@@ -430,50 +445,49 @@ static int oc_write(openair0_device_t *device, openair0_timestamp_t timestamp, v
   return nsamps;
 }
 
-static void initial_block_align (oc_state_t *s) {
+static void initial_block_align(rx_thr_t *rx)
+{
   LOG_I(HW, "Synchronizing rx\n");
   __attribute__((aligned(32))) uint32_t b[sizeof(rx_packet_t)];
-  uint64_t bytes = 0;
-  //while (1) {
-  ssize_t ret = read(s->fd_read, b, sizeof(b));
+  ssize_t ret = read(rx->fd_read, b, sizeof(b));
   if (ret != sizeof(b)) {
     LOG_E(HW, "Error reading %ld bytes: %ld (%s)\n", sizeof(b), ret, strerror(errno));
     usleep(10000);
     return;
   }
   uint i;
-  headerRx_t *rx = NULL;
+  headerRx_t *rxh = NULL;
   for (i = 0; i < sizeof(b) / sizeof(*b) - sizeof(headerRx_t); i++)
     if (b[i] == (magic_rx & UINT32_MAX) && b[i + 1] == ((magic_rx >> 32) & UINT32_MAX)) {
       LOG_D(HW, "found first magic at %d \n", i);
-      rx = (headerRx_t *)(b + i);
-      dumpHD("first header:", *rx);
+      rxh = (headerRx_t *)(b + i);
+      dumpHD("first header:", *rxh);
       break;
     }
   if (i == (sizeof(b) / sizeof(*b) - sizeof(headerRx_t))) {
     LOG_E(HW, "%%error magic not found\n");
     return;
   }
-  ret = read(s->fd_read, b, i * sizeof(*b));
-  s->seqNum = rx->packetSeqNum + 1;
-  s->rx_timestamp = (int64_t)rx->timestamp + rx->packetSz;
-  s->rx_ts_interface = rx->timestamp;
-  s->rx_count = 1;
+  ret = read(rx->fd_read, b, i * sizeof(*b));
+  rx->seqNum = rxh->packetSeqNum + 1;
+  rx->rx_timestamp = (int64_t)rxh->timestamp + rxh->packetSz;
+  rx->rx_ts_interface = rxh->timestamp;
+  rx->rx_count = 1;
 }
 
 static bool get_blocks(oc_state_t *s, rx_packet_t *p)
 {
+  rx_thr_t *rx = &s->rx;
   static struct timespec last_second={}, origin={};
   static struct timespec now={};
   static uint64_t tot_samples= 0;
 
-  int readSz = sizeof(*s->rx_live) * s->nb_blocks_per_read;
-  ssize_t ret = read(s->fd_read, p, readSz);
+  int readSz = sizeof(*rx->rx_live) * rx->nb_blocks_per_read;
+  ssize_t ret = read(rx->fd_read, p, readSz);
   if (ret != readSz || p[0].h.control != magic_rx) {
     LOG_E(HW, "Error reading header asked for %d bytes, got %ld, magic: %lx\n", readSz, ret, p[0].h.control);
     dumpHD("lost good header:", p[0].h);
-    // abort();
-    s->rx_count = -1;
+    rx->rx_count = -1;
     return false;
   }
 
@@ -482,68 +496,80 @@ static bool get_blocks(oc_state_t *s, rx_packet_t *p)
     last_second=now;
     origin=now;
   }
-  tot_samples += s->nb_blocks_per_read * sizeof(p->b) / sizeof(*p->b);
+  tot_samples += rx->nb_blocks_per_read * sizeof(p->b) / sizeof(*p->b);
   if (now.tv_sec != last_second.tv_sec) {
     LOG_I(HW,
-	  "driver avg read rate:%f\n errors during last second: %s %u, %s %u, %s %u, %s %u, present "
+          "driver avg read rate:%f\n errors during last second: %s %u, %s %u, %s %u, %s %u, present "
           "tx seq %u\n\n ",
           (float)tot_samples / (now.tv_sec * 1000000 - origin.tv_sec * 1000000 + now.tv_nsec / 1000.0 - origin.tv_nsec / 1000.0),
-	  s->txLate?"\x1B[93m""txLate""\x1B[0m":"txLate",
-	  s->txLate,
-	  s->txErr?"\x1B[93m""txSeqerr""\x1B[0m":"txSeqerr",
-          s->txErr,
-	  s->timerOverflow?"\x1B[93m""timerOverflow""\x1B[0m":"timerOverflow",
-          s->timerOverflow,
-	  s->atomicPacket?"\x1B[93m""atomicPacket""\x1B[0m":"atomicPacket",
-          s->atomicPacket,
-          s->txSeq);
-    s->txLate = s->txErr = s->timerOverflow = s->atomicPacket = 0;
+          rx->txLate ? "\x1B[93m"
+                       "txLate"
+                       "\x1B[0m"
+                     : "txLate",
+          rx->txLate,
+          rx->txErr ? "\x1B[93m"
+                      "txSeqerr"
+                      "\x1B[0m"
+                    : "txSeqerr",
+          rx->txErr,
+          rx->timerOverflow ? "\x1B[93m"
+                              "timerOverflow"
+                              "\x1B[0m"
+                            : "timerOverflow",
+          rx->timerOverflow,
+          rx->atomicPacket ? "\x1B[93m"
+                             "atomicPacket"
+                             "\x1B[0m"
+                           : "atomicPacket",
+          rx->atomicPacket,
+          s->tx.txSeq);
+    rx->txLate = rx->txErr = rx->timerOverflow = rx->atomicPacket = 0;
     last_second.tv_sec++;
   }
 
-  for (int i = 0; i <s->nb_blocks_per_read ; i++) {
-    if (s->rx_timestamp != (int64_t)p[i].h.timestamp)
+  for (int i = 0; i < rx->nb_blocks_per_read; i++) {
+    if (rx->rx_timestamp != (int64_t)p[i].h.timestamp)
       LOG_W(HW,
             "expected ts: %lu got %lu, diff %ld, seq num %d, atomicPacket %d, timerOverflow %d\n",
-            s->rx_timestamp,
+            rx->rx_timestamp,
             p[i].h.timestamp,
-            (int64_t)p[i].h.timestamp - s->rx_timestamp,
-            s->seqNum,
+            (int64_t)p[i].h.timestamp - rx->rx_timestamp,
+            rx->seqNum,
             (~p[i].f.atomicPacket & 0x01),
             p[i].f.timerOverflow);
-    s->rx_timestamp = p[i].h.timestamp + p[i].h.packetSz;
+    rx->rx_timestamp = p[i].h.timestamp + p[i].h.packetSz;
     /*
-    if (llabs((int64_t)s->lastPpsOffset - (int64_t)p[i].h.ppsOffset) > 12)
+    if (llabs((int64_t)rx->lastPpsOffset - (int64_t)p[i].h.ppsOffset) > 12)
       // pps_in is based on a real pulse from the GPS. It may have some jitter and drift during time.
       // Thus it is normal to have some diff between theoretical (expected) and real (measured) values.
       // >12 ->l means that we flag errors higher than +/- 0.1ppm.
       // When the board's FPGA starts, the vcxo is not yet discplined to the GPS, thus we may observe
       // some errors until the frequency error algorithm converges
       printf("expected pps offset %u got %u, diff %d, seq num %d\n",
-      s->lastPpsOffset,
+      rx->lastPpsOffset,
       p[i].h.ppsOffset,
-       p[i].h.ppsOffset- s->lastPpsOffset,
-       s->seqNum);
-       s->lastPpsOffset = (p[i].h.ppsOffset + READ_BLOCK_NB_SAMPLES )% 122880000 ;
+       p[i].h.ppsOffset- rx->lastPpsOffset,
+       rx->seqNum);
+       rx->lastPpsOffset = (p[i].h.ppsOffset + READ_BLOCK_NB_SAMPLES )% 122880000 ;
        if (!p[i].h.ppsAlive)
        printf("pps not alive\n");
     */
     if (p[i].h.TXlate) {
       LOG_D(HW, "TXlate\n");
-      s->txLate++;
+      rx->txLate++;
     }
     if (p[i].h.TXseqerr) {
-      LOG_W(HW, "TXseqerr, current tx seq is %u\n", s->txSeq);
-      s->txErr++;
+      LOG_W(HW, "TXseqerr, current tx seq is %u\n", s->tx.txSeq);
+      rx->txErr++;
     }
     if (p[i].f.control1 != magic_footer1 || p[i].f.control2 != magic_footer2)
       LOG_W(HW, "footer error\n");
     if (p[i].f.timerOverflow) {
       LOG_D(HW, "timerOverflow\n");
-      s->timerOverflow++;
+      rx->timerOverflow++;
     }
     if (p[i].f.atomicPacket) {
-      s->atomicPacket++;
+      rx->atomicPacket++;
       LOG_D(HW, "Not atomic\n");
     }
 
@@ -551,104 +577,108 @@ static bool get_blocks(oc_state_t *s, rx_packet_t *p)
     if (last_filler != p[i].f.filler)
       LOG_I(HW, "filler changed to %x\n", p[i].f.filler);
     last_filler = p[i].f.filler;
-    if (s->seqNum % 65536 != p[i].h.packetSeqNum) {
+    if (rx->seqNum % 65536 != p[i].h.packetSeqNum) {
       LOG_W(HW,
             "expected rx packet sequence number %u got %u, diff %d\n",
-            s->seqNum,
+            rx->seqNum,
             p[i].h.packetSeqNum,
-            p[i].h.packetSeqNum - s->seqNum);
-      s->seqNum = p[i].h.packetSeqNum;
-      //s->rx_count = -1;
-      //return false;
+            p[i].h.packetSeqNum - rx->seqNum);
+      rx->seqNum = p[i].h.packetSeqNum;
+      // rx->rx_count = -1;
+      // return false;
     }
-    s->seqNum++;
+    rx->seqNum++;
   }
-  s->last_rx->push(s->rx_timestamp);
-  LOG_D(HW, "read: %lu\n", s->rx_timestamp);
+
+  s->txHfull = p[rx->nb_blocks_per_read - 1].h.TXhfull;
+  if (!s->txHfull)
+    s->last_rx->push(rx->rx_timestamp);
+  LOG_D(HW, "read: %lu\n", rx->rx_timestamp);
   return true;
 }
 
 void *read_thread(void *arg)
 {
   oc_state_t *s = (oc_state_t *)arg;
+  rx_thr_t *rx = &s->rx;
   while (true) {
-    if (s->rx_count == -1)
-      initial_block_align(s);
-    if (s->rx_count == -1) {
+    if (rx->rx_count == -1)
+      initial_block_align(rx);
+    if (rx->rx_count == -1) {
       usleep(10);
       continue;
     }
-    if (s->read_queue->m_queue.size() > 100) {
+    if (rx->read_queue->m_queue.size() > 100) {
       if (!getenv("FAKE_RX"))
         LOG_W(HW, "rx consumer is too slow, trashing rx queue\n");
-      while (s->read_queue->m_queue.size())
-        free(s->read_queue->pop());
+      while (rx->read_queue->m_queue.size())
+        free(rx->read_queue->pop());
     }
-    rx_packet_t *tmp = (rx_packet_t *)malloc(sizeof(*s->rx_live) * s->nb_blocks_per_read);
+    rx_packet_t *tmp = (rx_packet_t *)malloc(sizeof(*rx->rx_live) * rx->nb_blocks_per_read);
     if (!get_blocks(s, tmp)) {
       printf("getblocks returned bad\n");
       free(tmp);
     } else
-      s->read_queue->push(tmp);
+      rx->read_queue->push(tmp);
   }
   return NULL;
 }
 
 static int oc_read(openair0_device_t *device, openair0_timestamp_t *ptimestamp, void **buff, int nsamps, int cc)
 {
-  oc_state_t *s = (oc_state_t *)device->priv;
+  rx_thr_t *rx = &((oc_state_t *)device->priv)->rx;
   static int64_t reads_cnt = 0;
   if (getenv("FAKE_RX") && reads_cnt > atoi(getenv("FAKE_RX"))) {
-    *ptimestamp = s->rx_ts_interface;
-    s->rx_ts_interface += nsamps;
+    *ptimestamp = rx->rx_ts_interface;
+    rx->rx_ts_interface += nsamps;
     return nsamps;
   }
   reads_cnt++;
   c16_t **output=(c16_t**)buff;
   int remain_to_get=nsamps;
   while (remain_to_get > 0) {
-    while (s->remain_samples > 0 && remain_to_get > 0) {
-      if (s->gap) {
+    while (rx->remain_samples > 0 && remain_to_get > 0) {
+      if (rx->gap) {
         c16_t *out = output[0] + nsamps - remain_to_get;
-        while (s->gap && remain_to_get) {
+        while (rx->gap && remain_to_get) {
           *out++ = {};
           remain_to_get--;
-          s->gap--;
-          s->rx_ts_interface++;
+          rx->gap--;
+          rx->rx_ts_interface++;
         }
       }
-      rx_packet_t *last_rx = s->rx_live;
+      rx_packet_t *last_rx = rx->rx_live;
       int nb_samples_per_packet = sizeof(last_rx[0].b) / sizeof(last_rx[0].b[0]);
-      int nb_samples=nb_samples_per_packet*s->nb_blocks_per_read;
-      int consumed_samples = nb_samples - s->remain_samples;
+      int nb_samples = nb_samples_per_packet * rx->nb_blocks_per_read;
+      int consumed_samples = nb_samples - rx->remain_samples;
       int nb_consumed_samples_in_block= consumed_samples%nb_samples_per_packet;
       int bloc = consumed_samples / nb_samples_per_packet;
       rx_packet_t *cur_pkt = last_rx + bloc;
-      if (nb_consumed_samples_in_block == 0 && cur_pkt->h.timestamp != (uint64_t)s->rx_ts_interface) {
-        s->gap = cur_pkt->h.timestamp - s->rx_ts_interface;
-        if (s->gap > 0 && s->gap < 1228800) {
-          LOG_W(HW, "gap of %ld, we fill \n", s->gap);
+      if (nb_consumed_samples_in_block == 0 && cur_pkt->h.timestamp != (uint64_t)rx->rx_ts_interface) {
+        rx->gap = cur_pkt->h.timestamp - rx->rx_ts_interface;
+        if (rx->gap > 0 && rx->gap < 1228800) {
+          LOG_W(HW, "gap of %ld, we fill \n", rx->gap);
           continue;
         } else {
-          LOG_W(HW, "gap of %ld, we break timestamp sequence %lu !=  %lu\n", s->gap, s->rx_ts_interface, cur_pkt->h.timestamp);
-          s->rx_ts_interface = cur_pkt->h.timestamp;
-          s->gap = 0;
+          LOG_W(HW, "gap of %ld, we break timestamp sequence %lu !=  %lu\n", rx->gap, rx->rx_ts_interface, cur_pkt->h.timestamp);
+          rx->rx_ts_interface = cur_pkt->h.timestamp;
+          rx->gap = 0;
         }
       }
       int remaing_samples_in_block= nb_samples_per_packet-nb_consumed_samples_in_block;
       int toCopy=std::min(remaing_samples_in_block,remain_to_get );
       memcpy(output[0] + nsamps - remain_to_get, cur_pkt->b + nb_consumed_samples_in_block, toCopy * sizeof(cur_pkt->b[0]));
-      s->remain_samples-=toCopy;
+      rx->remain_samples -= toCopy;
       remain_to_get -= toCopy;
-      s->rx_ts_interface += toCopy;
+      rx->rx_ts_interface += toCopy;
     }
     if(  remain_to_get > 0 ) {
-      free(s->rx_live);
-      s->rx_live = s->read_queue->pop();
-      s->remain_samples = sizeof(s->rx_live->b) * s->nb_blocks_per_read / sizeof(*s->rx_live->b);
+      free(rx->rx_live);
+      rx->rx_live = rx->read_queue->pop();
+      rx->remain_samples = sizeof(rx->rx_live->b) * rx->nb_blocks_per_read / sizeof(*rx->rx_live->b);
     }
   }
-  *ptimestamp = s->rx_ts_interface-nsamps;
+  *ptimestamp = rx->rx_ts_interface - nsamps;
   return nsamps;
 }
 
@@ -753,21 +783,21 @@ int oc_write_init(openair0_device_t *device)
 static int oc_start(openair0_device_t *device)
 {
   oc_state_t *s = (oc_state_t *)device->priv;
-  s->rx_count = -1;
+  s->rx.rx_count = -1;
   s->wait_for_first_pps = 1;
-  s->first_tx = true;
-  s->nb_blocks_per_read = NB_BLOCKS_PER_READ;
-  s->rx_live = (rx_packet_t *)malloc16(s->nb_blocks_per_read * sizeof(*s->rx_live));
-  s->ready_tx = new TSQueue<tx_packet_t *>;
-  s->read_queue = new TSQueue<rx_packet_t *>;
+  s->tx.first_tx = true;
+  s->rx.nb_blocks_per_read = NB_BLOCKS_PER_READ;
+  s->rx.rx_live = (rx_packet_t *)malloc16(s->rx.nb_blocks_per_read * sizeof(*s->rx.rx_live));
+  s->tx.ready_tx = new TSQueue<tx_packet_t *>;
+  s->rx.read_queue = new TSQueue<rx_packet_t *>;
   s->last_rx = new TSQueue<uint64_t>;
-  s->fd_write = open(s->filename_write, O_WRONLY);
-  if (s->fd_write < 0) {
+  s->tx.fd_write = open(s->filename_write, O_WRONLY);
+  if (s->tx.fd_write < 0) {
     LOG_E(HW, "Open %s failed, errno %d:%s\n", s->filename_write, errno, strerror(errno));
     exit(1);
   }
-  s->fd_read = open(s->filename_read, O_RDONLY);
-  if (s->fd_read < 0) {
+  s->rx.fd_read = open(s->filename_read, O_RDONLY);
+  if (s->rx.fd_read < 0) {
     LOG_E(HW, "Open %s failed, errno %d:%s\n", s->filename_read, errno, strerror(errno));
     exit(1);
   }
@@ -802,7 +832,7 @@ extern "C" {
       strcpy(st->filename_write, DEVICE_WRITE_DEFAULT);
       strcpy(st->filename_read, DEVICE_READ_DEFAULT);
       AssertFatal(st != NULL, "OC device: memory allocation failure\n");
-      st->continuous_tx = openair0_cfg->duplex_mode == duplex_mode_FDD;
+      st->tx.continuous_tx = openair0_cfg->duplex_mode == duplex_mode_FDD;
     } else {
       LOG_E(HW, "multiple calls to device init detected\n");
       return 0;
@@ -830,16 +860,16 @@ extern "C" {
       double tx_bw;
       double rx_bw;
     } config_table[] = {{245760000, 0, 200e6, 200e6},
-			{184320000, 179, 100e6, 100e6},
-			{122880000, 179, 80e6, 80e6},
-			{92160000, 0, 60e6, 60e6},
-			{61440000, 0, 40e6, 40e6},
-			{46080000, 0, 40e6, 40e6},
-			{30720000, 0, 40e6, 40e6},
-			{23040000, 0, 20e6, 20e6},
-			{15360000, 0, 10e6, 10e6},
-			{7680000, 0, 5e6, 5e6},
-			{1920000, 0, 1.25e6, 1.25e6}};
+                        {184320000, 180, 100e6, 100e6},
+                        {122880000, 180, 80e6, 80e6},
+                        {92160000, 0, 60e6, 60e6},
+                        {61440000, 0, 40e6, 40e6},
+                        {46080000, 0, 40e6, 40e6},
+                        {30720000, 0, 40e6, 40e6},
+                        {23040000, 0, 20e6, 20e6},
+                        {15360000, 0, 10e6, 10e6},
+                        {7680000, 0, 5e6, 5e6},
+                        {1920000, 0, 1.25e6, 1.25e6}};
     size_t i = 0;
     for (; i < sizeofArray(config_table); i++)
       if (config_table[i].sample_rate == (int)openair0_cfg[0].sample_rate) {

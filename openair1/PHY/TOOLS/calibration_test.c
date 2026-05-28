@@ -372,7 +372,7 @@ void *write_thread(void *arg)
     struct timespec now;
     clock_gettime(CLOCK_REALTIME, &now);
     if (now.tv_sec != last_second.tv_sec) {
-      LOG_I(HW, "write thread wrote %lu times in one second\n", count);
+      LOG_D(HW, "write thread wrote %lu times in one second\n", count);
       last_second = now;
       count = 0;
     }
