@@ -89,7 +89,7 @@ static const uint32_t magic_footer2 = 0x5A;
 
 #define WRITE_BLOCK_NB_SAMPLES 2048 * 4
 #define NB_BLOCKS_PER_WRITE 2
-static const uint64_t tx_ahead = WRITE_BLOCK_NB_SAMPLES * 4;
+//static const uint64_t tx_ahead = WRITE_BLOCK_NB_SAMPLES * 4;
 
 typedef struct {
   uint64_t control;
@@ -277,6 +277,25 @@ void *write_thread(void *arg)
       if (ts != cur->h.timestamp && tx->continuous_tx)
         LOG_E(HW, "tx is not contiguous\n");
       ts = cur->h.timestamp + cur->h.packetSz;
+      /*
+      int sz=sizeof(cur->h.timestamp)*8;
+      float sign[sz]={};
+      c16_t* rx=cur->b;
+      for (int i=0; i<cur->h.packetSz/8; i++){
+	int bit=i%sz;
+	for (int j=0; j<8; j++)
+	  sign[bit]+=rx[i*8+j].r*rx[i*8+j].r+rx[i*8+j].i*rx[i*8+j].i;
+      }
+      float total=0;
+      for (int i = 0; i < sz; i++)
+	total+=sign[i];
+      total/=sz;
+      uint64_t encoded_ts=0;
+      for (int i = 0; i < sz; i++)
+        if (sign[i] > total)
+	  encoded_ts|=1ULL<<i;
+      printf("driver diff encoded versus header %ld\n", cur->h.timestamp - (int64_t)encoded_ts);
+      */
       j += sizeof(headerTx_t) + cur->h.packetSz * sizeof(*cur->b);
     }
     uint sz_bytes = j - (uint8_t *)p;
@@ -346,7 +365,7 @@ static int32_t signalEnergy(c16_t *input, uint32_t length)
   return (uint32_t)((sums[0] + sums[1] + sums[2] + sums[3] + leftover_sum) / (float)length);
 }
 
-#define BURST_NUM_OF_PACKETS (8192u)
+#define BURST_NUM_OF_PACKETS (1u)
 // DC-filter: 0 will be done in FPGA after seeing 128-consecutive samples having the same value
 static inline int write_block(tx_thr_t *tx, c16_t *samples, uint sz, bool no_scaling)
 {
@@ -860,8 +879,8 @@ extern "C" {
       double tx_bw;
       double rx_bw;
     } config_table[] = {{245760000, 0, 200e6, 200e6},
-                        {184320000, 180, 100e6, 100e6},
-                        {122880000, 180, 80e6, 80e6},
+			{184320000, 176, 100e6, 100e6},
+			{122880000, 176, 80e6, 80e6},
                         {92160000, 0, 60e6, 60e6},
                         {61440000, 0, 40e6, 40e6},
                         {46080000, 0, 40e6, 40e6},
