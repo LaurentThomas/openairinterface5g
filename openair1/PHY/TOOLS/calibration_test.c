@@ -49,6 +49,7 @@ const int hole_size=10;
 pthread_cond_t tx_trig;
 
 static uint32_t rng_state = 2463534242u; // non-zero seed
+static int chip=32;
 
 static inline uint32_t xorshift32(void)
 {
@@ -301,6 +302,8 @@ void *write_thread(void *arg)
         // printf("%d, %d\n", file_input[i].r, file_input[i].i);
       }
       break;
+    case e_SIGNATURE:
+      break;
     default:
       abort();
     }
@@ -347,6 +350,22 @@ void *write_thread(void *arg)
     }
     do {
       last_tx_timestamp += params->dft_sz;
+      if (params->c->tx_pattern == e_SIGNATURE) {
+	uint64_t signature=last_tx_timestamp+ tx_ahead;
+	int nb_bits=sizeof(signature)*8;
+	memset(samplesTx[0],0,params->dft_sz*sizeof(c16_t));
+	for (int i=0; i<params->dft_sz/chip; i++) {
+	  c16_t val={};
+	  if (signature & (1ULL << (i%nb_bits))) {
+	    if (i&1)
+	      val=(c16_t){WAVE_AMP,WAVE_AMP};
+	    else
+	      val=(c16_t){-WAVE_AMP,-WAVE_AMP};
+	  }
+	  for (int j=0; j<chip; j++)
+	    samplesTx[0][i*chip+j]=val;
+	}
+      }
       if (num_samples) {
 	for (int i=0; i< params->dft_sz; i++)
 	  samplesTx[0][i]=file_input[(num_samples_file++)%num_samples];
@@ -388,6 +407,7 @@ void *read_thread(void *arg)
   int warmup=0;
   struct timespec last_second;
   clock_gettime(CLOCK_REALTIME, &last_second);
+  uint64_t old_sign=0;
   while (!oai_exit) {
     uint64_t old = rx_timestamp;
      __attribute__((aligned(32))) c16_t rx[ params->dft_sz ];
@@ -421,6 +441,26 @@ void *read_thread(void *arg)
 	  min_pos=i;
 	}
       }
+    }
+    if (params->c->tx_pattern == e_SIGNATURE) {
+      int sz=sizeof(rx_timestamp)*8;
+      float sign[sz]={};
+      for (int i=0; i<params->dft_sz/chip; i++){
+	int bit=i%sz;
+	c16_t *tmp=rx+i*chip;
+	for (int j=0; j<chip; j++)
+	    sign[bit]+=tmp[j].r*tmp[j].r+tmp[j].i*tmp[j].i;
+      }
+      float total=0;
+      for (int i = 0; i < sz; i++)
+	total+=sign[i];
+      total/=sz;
+      uint64_t encoded_ts=0;
+      for (int i = 0; i < sz; i++)
+        if (sign[i] > total)
+	  encoded_ts|=1ULL<<i;
+      printf("%lx, %lx diff with previous signature %ld, diff with header : %ld\n", rx_timestamp, encoded_ts,(int64_t)encoded_ts- old_sign, rx_timestamp - encoded_ts);
+      old_sign=encoded_ts;
     }
     AssertFatal(!pthread_mutex_lock(&params->txMutex), "");
     tx_timestamp = rx_timestamp;
@@ -499,7 +539,7 @@ int main(int argc, char **argv) {
   int lat=2; // micro second
   assert(sizeof(lat)==write(h,&lat,sizeof(lat)));
 
-  int sampling_rate = 30.72e6 * 6;
+  int sampling_rate = 30.72e6 * 4;
 
   int antennas = 1;
   uint64_t freq = c.freq * 1000;
