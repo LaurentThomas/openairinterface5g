@@ -871,7 +871,7 @@ extern "C" {
       std::cerr << "OC device initialized in subframes record mode" << std::endl;
     }
 
-    device->type = USRP_X300_DEV;
+    device->type = OC1_DEV;
 
     struct {
       int sample_rate;
@@ -879,8 +879,8 @@ extern "C" {
       double tx_bw;
       double rx_bw;
     } config_table[] = {{245760000, 0, 200e6, 200e6},
-			{184320000, 176, 100e6, 100e6},
-			{122880000, 176, 80e6, 80e6},
+			{184320000, 0, 100e6, 100e6},
+			{122880000, 180, 80e6, 80e6},
                         {92160000, 0, 60e6, 60e6},
                         {61440000, 0, 40e6, 40e6},
                         {46080000, 0, 40e6, 40e6},
@@ -890,6 +890,7 @@ extern "C" {
                         {7680000, 0, 5e6, 5e6},
                         {1920000, 0, 1.25e6, 1.25e6}};
     size_t i = 0;
+    openair0_cfg[0].sample_rate = 122880000; // only 122880000 is supported
     for (; i < sizeofArray(config_table); i++)
       if (config_table[i].sample_rate == (int)openair0_cfg[0].sample_rate) {
 	device->openair0_cfg->tx_sample_advance = config_table[i].tx_sample_advance;

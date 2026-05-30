@@ -2,10 +2,11 @@
 
 add_compile_options(-Wunused-parameter)
 #find_package(Boost REQUIRED)
-find_package(UHD REQUIRED UHD)
+#find_package(UHD REQUIRED UHD)
 
 add_library(oai_usrpdevif MODULE usrp_lib.cpp usrp_converters.cpp)
 #target_include_directories(oai_usrpdevif PRIVATE Boost::boost)
+
 target_link_libraries(oai_usrpdevif PRIVATE ${UHD_LIBRARIES})
 target_include_directories(oai_usrpdevif PRIVATE ${UHD_INCLUDE_DIRS})
 target_link_libraries(oai_usrpdevif PRIVATE log_headers)
