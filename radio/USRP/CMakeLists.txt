@@ -5,6 +5,7 @@ find_package(UHD REQUIRED UHD)
 message(STATUS "UHD version: ${UHD_VERSION}")
 
 add_library(oai_usrpdevif MODULE usrp_lib.cpp usrp_converters.cpp)
+
 target_link_libraries(oai_usrpdevif PRIVATE ${UHD_LIBRARIES})
 target_include_directories(oai_usrpdevif PRIVATE ${UHD_INCLUDE_DIRS})
 target_link_libraries(oai_usrpdevif PRIVATE log_headers)

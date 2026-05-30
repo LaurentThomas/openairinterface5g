@@ -451,13 +451,13 @@ void *read_thread(void *arg)
 	for (int j=0; j<chip; j++)
 	    sign[bit]+=tmp[j].r*tmp[j].r+tmp[j].i*tmp[j].i;
       }
-      float total=0;
+      float max=0;
       for (int i = 0; i < sz; i++)
-	total+=sign[i];
-      total/=sz;
+	if (sign[i] >max)
+	  max=sign[i];
       uint64_t encoded_ts=0;
       for (int i = 0; i < sz; i++)
-        if (sign[i] > total)
+        if (sign[i] > max/4)
 	  encoded_ts|=1ULL<<i;
       printf("%lx, %lx diff with previous signature %ld, diff with header : %ld\n", rx_timestamp, encoded_ts,(int64_t)encoded_ts- old_sign, rx_timestamp - encoded_ts);
       old_sign=encoded_ts;
@@ -539,7 +539,7 @@ int main(int argc, char **argv) {
   int lat=2; // micro second
   assert(sizeof(lat)==write(h,&lat,sizeof(lat)));
 
-  int sampling_rate = 30.72e6 * 4;
+  int sampling_rate = 30.72e6 * 6; // for X300 test, OC will overload it
 
   int antennas = 1;
   uint64_t freq = c.freq * 1000;
