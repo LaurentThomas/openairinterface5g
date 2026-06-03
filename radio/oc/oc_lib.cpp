@@ -89,7 +89,7 @@ static const uint32_t magic_footer2 = 0x5A;
 
 #define WRITE_BLOCK_NB_SAMPLES 2048 * 4
 #define NB_BLOCKS_PER_WRITE 2
-//static const uint64_t tx_ahead = WRITE_BLOCK_NB_SAMPLES * 4;
+static const uint64_t tx_ahead_max = 32 * 2048;
 
 typedef struct {
   uint64_t control;
@@ -249,7 +249,10 @@ void *write_thread(void *arg)
       do {
         struct timespec b, e;
         clock_gettime(CLOCK_REALTIME, &b);
-        uint64_t last_rx = s->last_rx->pop();
+        uint64_t last_rx;
+        do {
+          last_rx = s->last_rx->pop();
+        } while (last_rx + tx_ahead_max < p->h.timestamp);
         clock_gettime(CLOCK_REALTIME, &e);
         LOG_D(HW,
               "tx buffer was half full, blocked for %ld ns, rx ts: %lu, tx t: %lu\n",
@@ -305,6 +308,7 @@ void *write_thread(void *arg)
       LOG_E(HW, "write to SDR failed, request: %u, wrote %ld\n", sz_bytes, wrote);
     if (wrote < 0)
       LOG_E(HW, "write to %s failed, errno %d:%s\n", s->filename_write, errno, strerror(errno));
+
     LOG_D(HW, "wrote: for ts %lu, total size: %u\n", p->h.timestamp, sz_bytes);
     if (log_headers) {
       char str[60];
