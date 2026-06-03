@@ -49,7 +49,7 @@ const int hole_size=10;
 pthread_cond_t tx_trig;
 
 static uint32_t rng_state = 2463534242u; // non-zero seed
-static int chip=32;
+static int chip = 16;
 
 static inline uint32_t xorshift32(void)
 {
@@ -324,7 +324,7 @@ void *write_thread(void *arg)
   clock_gettime(CLOCK_REALTIME, &last_second);
 
   openair0_timestamp_t last_tx_timestamp = 0;
-  // this is tx ahead in main application, the driver has it's tx ahead that shuld be smaller to prevent starvation
+  // this is tx ahead in main application, the driver has it's tx ahead that should be smaller to prevent starvation
   const int tx_ahead =  params->dft_sz * 20;
   char *hole_flag = getenv("HOLE");
   uint64_t num_samples_file=0;
@@ -337,7 +337,7 @@ void *write_thread(void *arg)
       do {
         AssertFatal(!pthread_mutex_lock(&params->txMutex), "");
         AssertFatal(!pthread_cond_wait(&tx_trig, &params->txMutex), "");
-        new_tx = tx_timestamp & ~31;
+        new_tx = tx_timestamp;
         AssertFatal(!pthread_mutex_unlock(&params->txMutex), "");
       } while (last_tx_timestamp == new_tx);
     }
@@ -408,6 +408,7 @@ void *read_thread(void *arg)
   struct timespec last_second;
   clock_gettime(CLOCK_REALTIME, &last_second);
   uint64_t old_sign=0;
+  int nb_aligned = 0;
   while (!oai_exit) {
     uint64_t old = rx_timestamp;
      __attribute__((aligned(32))) c16_t rx[ params->dft_sz ];
@@ -457,9 +458,19 @@ void *read_thread(void *arg)
 	  max=sign[i];
       uint64_t encoded_ts=0;
       for (int i = 0; i < sz; i++)
-        if (sign[i] > max/4)
-	  encoded_ts|=1ULL<<i;
-      printf("%lx, %lx diff with previous signature %ld, diff with header : %ld\n", rx_timestamp, encoded_ts,(int64_t)encoded_ts- old_sign, rx_timestamp - encoded_ts);
+        if (sign[i] > max / 2)
+          encoded_ts |= 1ULL << i;
+      if (rx_timestamp == encoded_ts)
+        nb_aligned++;
+      else {
+        printf("after %d aligned packets, %lx, %lx diff with previous signature %ld, diff with header : %ld\n",
+               nb_aligned,
+               rx_timestamp,
+               encoded_ts,
+               (int64_t)encoded_ts - old_sign,
+               rx_timestamp - encoded_ts);
+        nb_aligned = 0;
+      }
       old_sign=encoded_ts;
     }
     AssertFatal(!pthread_mutex_lock(&params->txMutex), "");
