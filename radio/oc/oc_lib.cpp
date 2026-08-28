@@ -87,8 +87,8 @@ static const uint32_t magic_footer2 = 0x5A;
 #define READ_BLOCK_NB_SAMPLES 2048
 #define NB_BLOCKS_PER_READ 4
 
-#define WRITE_BLOCK_NB_SAMPLES 2048 * 4
-#define NB_BLOCKS_PER_WRITE 2
+#define WRITE_BLOCK_NB_SAMPLES 2048 * 2
+#define NB_BLOCKS_PER_WRITE 1
 static const uint64_t tx_ahead_max = 32 * 2048;
 
 typedef struct {
@@ -208,6 +208,7 @@ typedef struct {
   char filename_write[FILENAME_MAX];
   char filename_read[FILENAME_MAX];
   int wait_for_first_pps;
+  int ta;
   rx_thr_t rx;
   tx_thr_t tx;
   std::atomic<bool> txHfull;
@@ -243,6 +244,7 @@ void *write_thread(void *arg)
   uint64_t ts = 0;
   tx_thr_t *tx = &s->tx;
   bool do_rx = getenv("FAKE_RX") == NULL;
+  int nb_aligned = 0;
   do {
     tx_packet_t *p = tx->ready_tx->pop();
     if (do_rx && s->txHfull) {
@@ -273,49 +275,79 @@ void *write_thread(void *arg)
       ts=p[i].h.timestamp+WRITE_BLOCK_NB_SAMPLES;
       }*/
     struct timespec b, e;
-    clock_gettime(CLOCK_REALTIME,&b);
     uint8_t *j = (uint8_t *)p;
     for (int i = 0; i < NB_BLOCKS_PER_WRITE; i++) {
       tx_packet_t *cur = (tx_packet_t *)j;
+      clock_gettime(CLOCK_REALTIME,&b);
       if (ts != cur->h.timestamp && tx->continuous_tx)
         LOG_E(HW, "tx is not contiguous\n");
-      ts = cur->h.timestamp + cur->h.packetSz;
-      /*
-      int sz=sizeof(cur->h.timestamp)*8;
-      float sign[sz]={};
-      c16_t* rx=cur->b;
-      for (int i=0; i<cur->h.packetSz/8; i++){
-	int bit=i%sz;
-	for (int j=0; j<8; j++)
-	  sign[bit]+=rx[i*8+j].r*rx[i*8+j].r+rx[i*8+j].i*rx[i*8+j].i;
+
+      // verify encoded timestamp
+      // works only if dft and packet have same size and if chip = chip
+      if (getenv("VERIFY_ENCODING")) {
+        const int chip = atoi(getenv("VERIFY_ENCODING"));
+        int nb_bits = sizeof(cur->h.timestamp) * 8;
+        float sign[nb_bits] = {};
+        c16_t *tx = cur->b;
+        if (cur->h.packetSz != 8192)
+          abort();
+        for (int i = 0; i < cur->h.packetSz / chip; i++) {
+          int bit = i % nb_bits;
+          c16_t *tmp = tx + i * chip;
+          for (int j = 0; j < chip; j++)
+            sign[bit] += tmp[j].r * tmp[j].r + tmp[j].i * tmp[j].i;
+        }
+        float max = 0;
+        for (int i = 0; i < nb_bits; i++)
+          if (sign[i] > max)
+            max = sign[i];
+        uint64_t encoded_ts = 0;
+        for (int i = 0; i < nb_bits; i++)
+          if (sign[i] > max / 2)
+            encoded_ts |= 1ULL << i;
+        if (cur->h.timestamp + s->ta == encoded_ts)
+          nb_aligned++;
+        else {
+          printf("ERROR IN EMISSION after %d correct packets, header ts: %ld, encoded ts: %ld\n",
+                 nb_aligned,
+                 cur->h.timestamp,
+                 encoded_ts);
+          nb_aligned = 0;
+        }
       }
-      float total=0;
-      for (int i = 0; i < sz; i++)
-	total+=sign[i];
-      total/=sz;
-      uint64_t encoded_ts=0;
-      for (int i = 0; i < sz; i++)
-        if (sign[i] > total)
-	  encoded_ts|=1ULL<<i;
-      printf("driver diff encoded versus header %ld\n", cur->h.timestamp - (int64_t)encoded_ts);
-      */
+      if (log_headers) {
+	char str[60];
+	memset(str,' ', sizeof(str));
+	snprintf(str,sizeof(str), "%lu.%lu, %u, %lu, %u\n", b.tv_sec, b.tv_nsec,cur->h.packetSeqNum,cur->h.timestamp, cur->h.packetSz);
+	fwrite(str, sizeof(str),1,fd);
+      }
       j += sizeof(headerTx_t) + cur->h.packetSz * sizeof(*cur->b);
     }
+
     uint sz_bytes = j - (uint8_t *)p;
-    size_t wrote = write(tx->fd_write, p, sz_bytes);
+    if (!getenv("DIRECT")) {
+      size_t wrote = write(tx->fd_write, p, sz_bytes);
+      if (wrote != sz_bytes)
+	LOG_E(HW, "write to SDR failed, request: %u, wrote %ld\n", sz_bytes, wrote);
+      if (wrote < 0)
+	LOG_E(HW, "write to %s failed, errno %d:%s\n", s->filename_write, errno, strerror(errno));
+    }
+    else {
+      uint8_t *j = (uint8_t *)p;
+      for (int i = 0; i < NB_BLOCKS_PER_WRITE; i++) {
+	tx_packet_t *cur = (tx_packet_t *)j;
+	uint sz_bytes=cur->h.packetSz * sizeof(c16_t);
+	size_t wrote = write(tx->fd_write, cur->b, sz_bytes);
+	if (wrote != sz_bytes)
+	  LOG_E(HW, "write to SDR failed, request: %u, wrote %ld\n", sz_bytes, wrote);
+	if (wrote < 0)
+	  LOG_E(HW, "write to %s failed, errno %d:%s\n", s->filename_write, errno, strerror(errno));
+	j += sizeof(headerTx_t) + sz_bytes;
+      }
+    }
     clock_gettime(CLOCK_REALTIME,&e);
-    if (wrote != sz_bytes)
-      LOG_E(HW, "write to SDR failed, request: %u, wrote %ld\n", sz_bytes, wrote);
-    if (wrote < 0)
-      LOG_E(HW, "write to %s failed, errno %d:%s\n", s->filename_write, errno, strerror(errno));
 
     LOG_D(HW, "wrote: for ts %lu, total size: %u\n", p->h.timestamp, sz_bytes);
-    if (log_headers) {
-      char str[60];
-      memset(str,' ', sizeof(str));
-      snprintf(str,sizeof(str), "%lu.%lu, %lu, %u, %lu\n", b.tv_sec, b.tv_nsec,(e.tv_sec-b.tv_sec)*1000*1000*1000+e.tv_nsec-b.tv_nsec,p->h.packetSeqNum,p->h.timestamp);
-      fwrite(str, sizeof(str),1,fd);
-    }
     free(p);
   } while (true);
   return NULL;
@@ -420,15 +452,16 @@ static inline int write_block(tx_thr_t *tx, c16_t *samples, uint sz, bool no_sca
 
 static int oc_write(openair0_device_t *device, openair0_timestamp_t timestamp, void **buff, int nsamps, int cc, int flags)
 {
-  tx_thr_t *tx = &((oc_state_t *)device->priv)->tx;
+  oc_state_t *oc = (oc_state_t *)device->priv;
+  tx_thr_t *tx = &oc->tx;
 
-  timestamp -= device->openair0_cfg->command_line_sample_advance + device->openair0_cfg->tx_sample_advance;
+  timestamp -= device->openair0_cfg->command_line_sample_advance + oc->ta;
 
   if (tx->first_tx) {
     tx->tx_ts = timestamp;
     tx->first_tx = false;
   }
-
+  if (!getenv("DIRECT")) {
   int64_t gap = timestamp - tx->tx_ts;
   if (gap < 0) {
     LOG_E(HW, "out of sequence\n");
@@ -439,7 +472,7 @@ static int oc_write(openair0_device_t *device, openair0_timestamp_t timestamp, v
     LOG_I(HW, "gap of %ld\n", gap);
   else
     LOG_D(HW, ".\n");
-
+  }
   int wr_sz = nsamps;
   // LOG_E(HW, "ask to write %d\n", wr_sz);
   while (wr_sz > 0) {
@@ -450,8 +483,9 @@ static int oc_write(openair0_device_t *device, openair0_timestamp_t timestamp, v
     wr_sz -= sz;
   }
 
-  if (tx->tx_ts != timestamp + nsamps)
-    LOG_E(HW,"tx samples count error\n");
+  if (!getenv("DIRECT"))
+    if (tx->tx_ts != timestamp + nsamps)
+      LOG_E(HW,"tx samples count error\n");
   tx->tx_ts = timestamp + nsamps;
 
 #if 0
@@ -883,8 +917,8 @@ extern "C" {
       double tx_bw;
       double rx_bw;
     } config_table[] = {{245760000, 0, 200e6, 200e6},
-			{184320000, 0, 100e6, 100e6},
-			{122880000, 180, 80e6, 80e6},
+                        {184320000, 0, 100e6, 100e6},
+                        {122880000, 179, 80e6, 80e6},
                         {92160000, 0, 60e6, 60e6},
                         {61440000, 0, 40e6, 40e6},
                         {46080000, 0, 40e6, 40e6},
@@ -897,10 +931,10 @@ extern "C" {
     openair0_cfg[0].sample_rate = 122880000; // only 122880000 is supported
     for (; i < sizeofArray(config_table); i++)
       if (config_table[i].sample_rate == (int)openair0_cfg[0].sample_rate) {
-	device->openair0_cfg->tx_sample_advance = config_table[i].tx_sample_advance;
-	device->openair0_cfg->tx_bw = config_table[i].tx_bw;
-	device->openair0_cfg->rx_bw = config_table[i].rx_bw;
-	break;
+        st->ta = device->openair0_cfg->tx_sample_advance = config_table[i].tx_sample_advance;
+        device->openair0_cfg->tx_bw = config_table[i].tx_bw;
+        device->openair0_cfg->rx_bw = config_table[i].rx_bw;
+        break;
       }
     if (i == sizeofArray(config_table)) {
       LOG_E(HW, "unknown sampling rate: %d\n", (int)openair0_cfg[0].sample_rate);
