@@ -44,12 +44,13 @@ void set_taus_seed(unsigned int seed_init){};
 // configmodule_interface_t *uniqCfg = NULL;
 openair0_timestamp_t rx_timestamp = 0;
 openair0_timestamp_t tx_timestamp = 0;
+openair0_timestamp_t samples_to_insert=0;
 openair0_timestamp_t last_hole = 0;
 const int hole_size=10;
 pthread_cond_t tx_trig;
 
 static uint32_t rng_state = 2463534242u; // non-zero seed
-static int chip = 16;
+static int chip = 4;
 
 static inline uint32_t xorshift32(void)
 {
@@ -381,8 +382,27 @@ void *write_thread(void *arg)
 	LOG_W(HW,"Set hole for: %lu\n", last_hole);
 	AssertFatal(!pthread_mutex_unlock(&params->txMutex), "");
       }
-      params->rfdevice
-          ->trx_write_func(params->rfdevice, last_tx_timestamp + tx_ahead, (void **)samplesTx, params->dft_sz, params->antennas, 0);
+      int sz=params->dft_sz;
+      AssertFatal(!pthread_mutex_lock(&params->txMutex), "");
+      int toshift=samples_to_insert;
+      samples_to_insert=0;
+      AssertFatal(!pthread_mutex_unlock(&params->txMutex), "");
+      if (toshift >0) {
+	LOG_W(PHY,"shorten one packet of %d\n", toshift);
+	if (toshift < params->dft_sz) {
+	  sz-=toshift;
+	  params->rfdevice
+	    ->trx_write_func(params->rfdevice, last_tx_timestamp + tx_ahead, (void **)samplesTx, sz, params->antennas, 0);
+	}
+      } else {
+	if (toshift < 0) {
+	  LOG_W(PHY,"add one packet of %d\n", -toshift);
+	  params->rfdevice
+	    ->trx_write_func(params->rfdevice, last_tx_timestamp + tx_ahead, (void **)samplesTx, min (params->dft_sz,-toshift), params->antennas, 0);
+	}
+	params->rfdevice
+          ->trx_write_func(params->rfdevice, last_tx_timestamp + tx_ahead, (void **)samplesTx, sz, params->antennas, 0);
+      }
       if(loc >= 0)
 	memcpy(samplesTx[0]+loc, tmp, sizeof(tmp));
       count++;
@@ -477,6 +497,7 @@ void *read_thread(void *arg)
     tx_timestamp = rx_timestamp;
     if (min < tot_pow/(2*tot_samples)) {
       LOG_I(HW, "found hole %lu, programmed for %lu, received %ld later\n", min_pos+rx_timestamp, last_hole,min_pos+rx_timestamp - last_hole  );
+      samples_to_insert=min_pos+rx_timestamp - last_hole ;
     }
     warmup++;
     if (warmup > 1024)
@@ -610,7 +631,7 @@ int main(int argc, char **argv) {
   pthread_mutexattr_init(&attr);
   pthread_mutexattr_settype(&attr, PTHREAD_MUTEX_ERRORCHECK);
   AssertFatal(!pthread_mutex_init(&params.txMutex, &attr), "");
-  AssertFatal(!pthread_mutex_init(&params.txMutex, &attr), "");
+  AssertFatal(!pthread_mutex_init(&params.rxMutex, &attr), "");
   AssertFatal(!pthread_cond_init(&tx_trig, NULL), "");
   CalibrationInitScope(&params);
   rfdevice.trx_start_func(&rfdevice);

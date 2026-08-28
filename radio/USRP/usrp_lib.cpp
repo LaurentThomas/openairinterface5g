@@ -1299,7 +1299,7 @@ extern "C" {
         break;
     }
   }
-
+  /*
   if(openair0_cfg[0].tx_subdev!=NULL){
     LOG_I(HW, "openair0_cfg[0].tx_subdev == %s\n", openair0_cfg[0].tx_subdev);
     tx_subdev = openair0_cfg[0].tx_subdev;
@@ -1311,7 +1311,7 @@ extern "C" {
     rx_subdev = openair0_cfg[0].rx_subdev;
     s->usrp->set_rx_subdev_spec(rx_subdev);
   }
-
+  */
   for(int i=0; i<((int) s->usrp->get_rx_num_channels()); i++) {
     openair0_config_t *cfg = &openair0_cfg[0];
     if (i < cfg->rx_num_channels) {
