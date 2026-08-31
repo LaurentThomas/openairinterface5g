@@ -23,6 +23,7 @@
 
 #define  GET_NID2_SL(Nid_SL)          (Nid_SL/NUMBER_SSS_SEQUENCE)
 #define  GET_NID1_SL(Nid_SL)          (Nid_SL%NUMBER_SSS_SEQUENCE)
+
 #define SSS_METRIC_FLOOR_NR (3) // ratio signal sss sequence power against signal power
 
 typedef struct {
