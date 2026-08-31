@@ -6,7 +6,7 @@ message(STATUS "UHD version: ${UHD_VERSION}")
 
 add_library(oai_usrpdevif MODULE usrp_lib.cpp usrp_converters.cpp)
 
-target_link_libraries(oai_usrpdevif PRIVATE ${UHD_LIBRARIES})
+target_link_libraries(oai_usrpdevif PRIVATE Boost::thread ${UHD_LIBRARIES})
 target_include_directories(oai_usrpdevif PRIVATE ${UHD_INCLUDE_DIRS})
 target_link_libraries(oai_usrpdevif PRIVATE log_headers)
 if (UHD_VERSION VERSION_EQUAL "4.11.0")

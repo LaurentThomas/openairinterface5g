@@ -87,7 +87,7 @@ static const uint32_t magic_footer2 = 0x5A;
 #define READ_BLOCK_NB_SAMPLES 2048
 #define NB_BLOCKS_PER_READ 4
 
-#define WRITE_BLOCK_NB_SAMPLES 2048 * 2
+#define WRITE_BLOCK_NB_SAMPLES 2048 * 4
 #define NB_BLOCKS_PER_WRITE 1
 static const uint64_t tx_ahead_max = 32 * 2048;
 
@@ -918,7 +918,7 @@ extern "C" {
       double rx_bw;
     } config_table[] = {{245760000, 0, 200e6, 200e6},
                         {184320000, 0, 100e6, 100e6},
-                        {122880000, 179, 80e6, 80e6},
+                        {122880000, 186, 80e6, 80e6},
                         {92160000, 0, 60e6, 60e6},
                         {61440000, 0, 40e6, 40e6},
                         {46080000, 0, 40e6, 40e6},
