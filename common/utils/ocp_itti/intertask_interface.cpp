@@ -451,7 +451,7 @@ typedef struct timer_elm_s {
     if (handler == NULL) /* no handler given: install default */
       handler = catch_sigterm;
     signal(SIGTERM, handler);
-    signal(SIGINT, handler);
+    //signal(SIGINT, handler);
 
     rc = sem_wait(&itti_sem_block);
     AssertFatal(rc == 0, "error in sem_wait(): %d %s\n", errno, strerror(errno));
