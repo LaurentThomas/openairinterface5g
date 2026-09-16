@@ -744,6 +744,12 @@ static int oc_set_freq(openair0_device_t *device, openair0_config_t *openair0_cf
         openair0_cfg[0].tx_freq[0],
         openair0_cfg[0].rx_freq[0],
         openair0_cfg[0].tune_offset);
+  char txt[1024]={};
+  snprintf(txt, sizeof(txt)-1,  "%s --xcvr --txfreq %lu --rxfreq %lu\n", getenv("MONITOR"), (uint64_t)openair0_cfg[0].tx_freq[0],
+	   (uint64_t)openair0_cfg[0].rx_freq[0]);
+  int ret=system(txt);
+  if (ret!=0)
+    LOG_E(HW, "Mykonos call failed %d\n", ret);
   return 0;
 }
 
@@ -855,14 +861,14 @@ static int oc_start(openair0_device_t *device)
     LOG_E(HW, "Open %s failed, errno %d:%s\n", s->filename_read, errno, strerror(errno));
     exit(1);
   }
-  pthread_t w_thread;
-  threadCreate(&w_thread, write_thread, s, (char *)"write_thr", -1, OAI_PRIORITY_RT);
-  pthread_t r_thread;
-  threadCreate(&r_thread, read_thread, s, (char *)"read_thr", -1, OAI_PRIORITY_RT);
   oc_set_gains(device, device->openair0_cfg);
   oc_set_freq(device, device->openair0_cfg);
   sync_to_gps(device);
   check_ref_locked(s);
+  pthread_t w_thread;
+  threadCreate(&w_thread, write_thread, s, (char *)"write_thr", -1, OAI_PRIORITY_RT);
+  pthread_t r_thread;
+  threadCreate(&r_thread, read_thread, s, (char *)"read_thr", -1, OAI_PRIORITY_RT);
   // Fixme: set sampling rate, lack of API in OAI
   return 0;
 }
