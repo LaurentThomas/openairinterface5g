@@ -15,6 +15,7 @@
 #include "tools_defs.h"
 #include "LOG/log.h"
 #include <pthread.h>
+#include <stdio.h>
 
 static pthread_mutex_t sr_twiddle_mutex = PTHREAD_MUTEX_INITIALIZER;
 
@@ -117,6 +118,8 @@ typedef struct {
 
 static __thread x86_dft_tls_buffer_t g_x86_dft_q15_work;
 static __thread x86_dft_tls_buffer_t g_x86_dft_split_work;
+static __thread x86_dft_tls_buffer_t g_x86_dft_adaptive_work;
+static __thread x86_dft_tls_buffer_t g_x86_idft_output_work;
 static __thread x86_dft_tls_buffer_t g_x86_dft_recursive_work[X86_DFT_RECURSION_MAX_DEPTH];
 static __thread unsigned int g_x86_dft_recursive_depth;
 
@@ -145,6 +148,16 @@ static inline c16_t *x86_dft_tls_split_work(size_t need)
   return x86_dft_tls_buffer_get(&g_x86_dft_split_work, need);
 }
 
+static inline c16_t *x86_dft_tls_adaptive_work(size_t need)
+{
+  return x86_dft_tls_buffer_get(&g_x86_dft_adaptive_work, need);
+}
+
+static inline c16_t *x86_idft_tls_output_work(size_t need)
+{
+  return x86_dft_tls_buffer_get(&g_x86_idft_output_work, need);
+}
+
 static inline c16_t *x86_dft_recursive_work_acquire(size_t need)
 {
   AssertFatal(g_x86_dft_recursive_depth < X86_DFT_RECURSION_MAX_DEPTH,
@@ -166,6 +179,684 @@ static inline void x86_dft_recursive_work_release(void)
 static inline int is_power_of_two_int(int x)
 {
   return x > 0 && ((x & (x - 1)) == 0);
+}
+
+
+static pthread_once_t g_x86_dft_adaptive_once = PTHREAD_ONCE_INIT;
+static int g_x86_dft_adaptive_ready;
+static int g_x86_dft_adaptive_override = -1;
+static int g_x86_idft_adaptive_override = -1;
+
+/* Sizes below 512 never enter the adaptive path.  The empirical table covers
+ * every characterized forward DFT size from 512 through 12288; larger sizes
+ * retain the legacy fallback until they are characterized separately. */
+#define X86_DFT_ADAPTIVE_MIN_N 512
+
+static inline int x86_dft_parse_adaptive_env(const char *name)
+{
+  const char *value = getenv(name);
+  if (value && value[0] == '0' && value[1] == '\0')
+    return 0;
+  if (value && value[0] == '1' && value[1] == '\0')
+    return 1;
+  return -1;
+}
+
+static void x86_dft_adaptive_initialize_once(void)
+{
+  g_x86_dft_adaptive_override = x86_dft_parse_adaptive_env("OAI_DFT_ADAPTIVE");
+  g_x86_idft_adaptive_override = x86_dft_parse_adaptive_env("OAI_IDFT_ADAPTIVE");
+
+  /* Preserve the previous global-override behavior when the new IDFT-specific
+   * variable is not set.  Setting OAI_IDFT_ADAPTIVE makes the directions
+   * independently controllable. */
+  if (g_x86_idft_adaptive_override < 0 && g_x86_dft_adaptive_override >= 0)
+    g_x86_idft_adaptive_override = g_x86_dft_adaptive_override;
+
+  __atomic_store_n(&g_x86_dft_adaptive_ready, 1, __ATOMIC_RELEASE);
+}
+
+static inline void x86_dft_adaptive_ensure_initialized(void)
+{
+  if (__builtin_expect(__atomic_load_n(&g_x86_dft_adaptive_ready, __ATOMIC_ACQUIRE), 1))
+    return;
+  pthread_once(&g_x86_dft_adaptive_once, x86_dft_adaptive_initialize_once);
+}
+
+static inline int x86_dft_adaptive_enabled_from_scale(uint8_t scale_flag)
+{
+  x86_dft_adaptive_ensure_initialized();
+  return g_x86_dft_adaptive_override >= 0 ? g_x86_dft_adaptive_override : (scale_flag != 0);
+}
+
+static inline int x86_idft_adaptive_enabled_from_scale(uint8_t scale_flag)
+{
+  x86_dft_adaptive_ensure_initialized();
+  return g_x86_idft_adaptive_override >= 0 ? g_x86_idft_adaptive_override : (scale_flag != 0);
+}
+
+static inline __m256i x86_dft_abs_sat_epi16_256(__m256i x)
+{
+  /* For threshold/max tests INT16_MIN may stay at unsigned magnitude 32768.
+   * All adaptive thresholds are <= 24576, so this is conservative and saves
+   * the extra shift/sub pair previously used to clamp it to 32767. */
+  return _mm256_abs_epi16(x);
+}
+
+static inline uint16_t x86_dft_hmax_epu16_256(__m256i x)
+{
+  __m128i m = _mm_max_epu16(_mm256_castsi256_si128(x), _mm256_extracti128_si256(x, 1));
+  m = _mm_max_epu16(m, _mm_srli_si128(m, 8));
+  m = _mm_max_epu16(m, _mm_srli_si128(m, 4));
+  m = _mm_max_epu16(m, _mm_srli_si128(m, 2));
+  return (uint16_t)_mm_extract_epi16(m, 0);
+}
+
+/* Conservative headroom for the actual first x86 stage.  Positive adaptive
+ * gain is allowed only when the input remains below this bound. */
+static inline uint16_t x86_dft_adaptive_safe_peak(int N)
+{
+  switch (N) {
+    case 1: return 32767;
+    case 4:
+    case 8:
+    case 16:
+    case 32:
+    case 64:
+    case 128: return 16383;
+    case 12:
+    case 24: return 10922; /* R3 */
+    case 20: return 6553;  /* R5 */
+
+    case 72:
+    case 108:
+    case 288:
+    case 576:
+    case 648:
+    case 972:
+    case 1296:
+    case 2304:
+    case 2592: return 3640; /* R9 root */
+
+    case 96:
+    case 192: return 2730; /* R12 */
+    case 120:
+    case 240: return 2184; /* R15 */
+    case 144:
+    case 1152: return 1820; /* R18 */
+    case 216:
+    case 432:
+    case 864:
+    case 1728: return 1213; /* R27 */
+    case 300: return 1310; /* R25 */
+    case 360:
+    case 480:
+    case 600:
+    case 720:
+    case 960:
+    case 1920:
+    case 2160: return 1092; /* R30 */
+    case 384:
+    case 1536:
+    case 3072:
+    case 6144:
+    case 12288: return 1365; /* R24 */
+    case 1200:
+    case 2400: return 10922; /* outer R3 */
+    case 1440: return 6553; /* outer R5 */
+    default: break;
+  }
+
+  if (is_power_of_two_int(N)) {
+    if (N == 256 || N == 1024 || N == 16384)
+      return 2047; /* R16 */
+    if (N >= 512 && N <= 65536)
+      return 4095; /* R8 */
+    return 0;      /* split-radix / unvalidated large power-of-two */
+  }
+
+  /* Match the generic x86 dispatch order: radix-5 precedes radix-3. */
+  if ((N % 5) == 0)
+    return 6553;
+  if ((N % 3) == 0)
+    return 10922;
+  return 0;
+}
+
+static inline int16_t x86_dft_q15_shift_scalar(int16_t x, int shift)
+{
+  if (shift > 0)
+    return sat_i16((long)x << shift);
+  if (shift < 0) {
+    const int r = -shift;
+    const int32_t bias = 1 << (r - 1);
+    const int32_t mask = (1 << r) - 1;
+    const int32_t t = (int32_t)x + bias;
+    const int32_t y = t >= 0 ? (t >> r) : -(((-t) + mask) >> r);
+    return (int16_t)y;
+  }
+  return x;
+}
+
+static inline __m256i x86_dft_shift_q15_256(__m256i x, int shift)
+{
+  /* One invariant variable-count shift handles both +1 and +2.  This avoids
+   * two equality branches at every inlined root load; GCC can hoist the count
+   * setup out of the surrounding AVX2 loop. */
+  if (__builtin_expect(shift > 0, 1))
+    return _mm256_sll_epi16(x, _mm_cvtsi32_si128(shift));
+  if (shift < 0) {
+    const __m256i lsb = _mm256_and_si256(x, _mm256_set1_epi16(1));
+    return _mm256_add_epi16(_mm256_srai_epi16(x, 1), lsb);
+  }
+  return x;
+}
+
+static inline __m128i x86_dft_shift_q15_128(__m128i x, int shift)
+{
+  if (__builtin_expect(shift > 0, 1))
+    return _mm_sll_epi16(x, _mm_cvtsi32_si128(shift));
+  if (shift < 0) {
+    const __m128i lsb = _mm_and_si128(x, _mm_set1_epi16(1));
+    return _mm_add_epi16(_mm_srai_epi16(x, 1), lsb);
+  }
+  return x;
+}
+
+static inline void x86_dft_shift_copy_q15_avx2(const c16_t *src, c16_t *dst, int N, int shift)
+{
+  const int16_t *s = (const int16_t *)src;
+  int16_t *d = (int16_t *)dst;
+  const int components = 2 * N;
+  int k = 0;
+
+  /* Build the positive shift count once, then stream load/shift/store
+   * without a branch in every YMM block. */
+  if (__builtin_expect(shift > 0, 1)) {
+    const __m128i count = _mm_cvtsi32_si128(shift);
+    for (; k + 64 <= components; k += 64) {
+      const __m256i x0 = _mm256_sll_epi16(_mm256_loadu_si256((const __m256i *)(s + k + 0)), count);
+      const __m256i x1 = _mm256_sll_epi16(_mm256_loadu_si256((const __m256i *)(s + k + 16)), count);
+      const __m256i x2 = _mm256_sll_epi16(_mm256_loadu_si256((const __m256i *)(s + k + 32)), count);
+      const __m256i x3 = _mm256_sll_epi16(_mm256_loadu_si256((const __m256i *)(s + k + 48)), count);
+      _mm256_storeu_si256((__m256i *)(d + k + 0), x0);
+      _mm256_storeu_si256((__m256i *)(d + k + 16), x1);
+      _mm256_storeu_si256((__m256i *)(d + k + 32), x2);
+      _mm256_storeu_si256((__m256i *)(d + k + 48), x3);
+    }
+    for (; k + 16 <= components; k += 16) {
+      const __m256i x = _mm256_sll_epi16(_mm256_loadu_si256((const __m256i *)(s + k)), count);
+      _mm256_storeu_si256((__m256i *)(d + k), x);
+    }
+    for (; k < components; k++)
+      d[k] = sat_i16((long)s[k] << shift);
+    return;
+  }
+
+  for (; k + 64 <= components; k += 64) {
+    const __m256i x0 = x86_dft_shift_q15_256(_mm256_loadu_si256((const __m256i *)(s + k + 0)), shift);
+    const __m256i x1 = x86_dft_shift_q15_256(_mm256_loadu_si256((const __m256i *)(s + k + 16)), shift);
+    const __m256i x2 = x86_dft_shift_q15_256(_mm256_loadu_si256((const __m256i *)(s + k + 32)), shift);
+    const __m256i x3 = x86_dft_shift_q15_256(_mm256_loadu_si256((const __m256i *)(s + k + 48)), shift);
+    _mm256_storeu_si256((__m256i *)(d + k + 0), x0);
+    _mm256_storeu_si256((__m256i *)(d + k + 16), x1);
+    _mm256_storeu_si256((__m256i *)(d + k + 32), x2);
+    _mm256_storeu_si256((__m256i *)(d + k + 48), x3);
+  }
+  for (; k + 16 <= components; k += 16) {
+    const __m256i x = x86_dft_shift_q15_256(_mm256_loadu_si256((const __m256i *)(s + k)), shift);
+    _mm256_storeu_si256((__m256i *)(d + k), x);
+  }
+  for (; k < components; k++)
+    d[k] = x86_dft_q15_shift_scalar(s[k], shift);
+}
+
+static inline uint64_t x86_dft_abs_i64(int64_t x)
+{
+  return (uint64_t)(x < 0 ? -x : x);
+}
+
+/* A low peak alone does not justify +1/+2 for strongly phase-coherent input.
+ * Sample 16 uniformly spaced points and, when needed, 16 offset points. */
+static inline int x86_dft_adaptive_coherence_allows_positive_shift(const c16_t *src,
+                                                                    int N,
+                                                                    uint16_t peak)
+{
+  if (N <= 1 || peak == 0)
+    return 1;
+
+  int64_t sum_re = 0;
+  int64_t sum_im = 0;
+  for (int i = 0; i < 16; i++) {
+    const int sample = (i * N) >> 4;
+    sum_re += src[sample].r;
+    sum_im += src[sample].i;
+  }
+
+  const uint64_t coherent = x86_dft_abs_i64(sum_re) + x86_dft_abs_i64(sum_im);
+  const uint64_t scale = (uint64_t)peak * 16u;
+  if (coherent * 16u < scale * 7u)
+    return 1;
+
+  if (N < 32)
+    return 0;
+
+  sum_re = 0;
+  sum_im = 0;
+  const int offset = N >> 5;
+  for (int i = 0; i < 16; i++) {
+    int sample = ((i * N) >> 4) + offset;
+    if (sample >= N)
+      sample -= N;
+    sum_re += src[sample].r;
+    sum_im += src[sample].i;
+  }
+
+  const uint64_t coherent2 = x86_dft_abs_i64(sum_re) + x86_dft_abs_i64(sum_im);
+  return coherent2 * 16u < scale * 7u;
+}
+
+static inline int x86_dft_adaptive_choose_shift_legacy(const c16_t *src, int N, uint8_t scale_flag)
+{
+  if (N < X86_DFT_ADAPTIVE_MIN_N)
+    return 0;
+  if (!x86_dft_adaptive_enabled_from_scale(scale_flag))
+    return 0;
+
+  const uint16_t safe_peak = x86_dft_adaptive_safe_peak(N);
+  if (!safe_peak)
+    return 0;
+
+  const int16_t *v = (const int16_t *)src;
+  const int components = 2 * N;
+  const uint16_t positive_limit = safe_peak >> 1;
+  const __m256i vlimit = _mm256_set1_epi16((int16_t)positive_limit);
+  const __m256i vhot_minus1 = _mm256_set1_epi16(24575);
+  int k = 0;
+
+  /*
+   * Scan only as far as needed.
+   *
+   * A positive adaptive gain is legal only while every component stays <=
+   * safe_peak/2.  Therefore each 128-component AVX2 block can reject +1/+2
+   * immediately, instead of always reading the whole input.  The full scan is
+   * required only while a positive shift remains possible.  A component at
+   * or above 24576 selects the -1 high-amplitude guard.
+   */
+  __m256i vmax0 = _mm256_setzero_si256();
+  __m256i vmax1 = _mm256_setzero_si256();
+  __m256i vmax2 = _mm256_setzero_si256();
+  __m256i vmax3 = _mm256_setzero_si256();
+
+  for (; k + 128 <= components; k += 128) {
+    __m256i b0 = x86_dft_abs_sat_epi16_256(_mm256_loadu_si256((const __m256i *)(v + k +   0)));
+    __m256i b1 = x86_dft_abs_sat_epi16_256(_mm256_loadu_si256((const __m256i *)(v + k +  16)));
+    __m256i b2 = x86_dft_abs_sat_epi16_256(_mm256_loadu_si256((const __m256i *)(v + k +  32)));
+    __m256i b3 = x86_dft_abs_sat_epi16_256(_mm256_loadu_si256((const __m256i *)(v + k +  48)));
+    b0 = _mm256_max_epu16(b0, x86_dft_abs_sat_epi16_256(_mm256_loadu_si256((const __m256i *)(v + k +  64))));
+    b1 = _mm256_max_epu16(b1, x86_dft_abs_sat_epi16_256(_mm256_loadu_si256((const __m256i *)(v + k +  80))));
+    b2 = _mm256_max_epu16(b2, x86_dft_abs_sat_epi16_256(_mm256_loadu_si256((const __m256i *)(v + k +  96))));
+    b3 = _mm256_max_epu16(b3, x86_dft_abs_sat_epi16_256(_mm256_loadu_si256((const __m256i *)(v + k + 112))));
+
+    const __m256i block_max = _mm256_max_epu16(_mm256_max_epu16(b0, b1), _mm256_max_epu16(b2, b3));
+
+    /* unsigned block_max >= 24576 */
+    const __m256i hot = _mm256_subs_epu16(block_max, vhot_minus1);
+    if (__builtin_expect(!_mm256_testz_si256(hot, hot), 0))
+      return -1;
+
+    /* unsigned block_max > safe_peak/2 => +1/+2 can no longer be legal. */
+    const __m256i over = _mm256_subs_epu16(block_max, vlimit);
+    if (__builtin_expect(!_mm256_testz_si256(over, over), 1))
+      return 0;
+
+    vmax0 = _mm256_max_epu16(vmax0, b0);
+    vmax1 = _mm256_max_epu16(vmax1, b1);
+    vmax2 = _mm256_max_epu16(vmax2, b2);
+    vmax3 = _mm256_max_epu16(vmax3, b3);
+  }
+
+  __m256i vmax = _mm256_max_epu16(_mm256_max_epu16(vmax0, vmax1),
+                                  _mm256_max_epu16(vmax2, vmax3));
+
+  for (; k + 16 <= components; k += 16) {
+    const __m256i a = x86_dft_abs_sat_epi16_256(_mm256_loadu_si256((const __m256i *)(v + k)));
+    const __m256i hot = _mm256_subs_epu16(a, vhot_minus1);
+    if (__builtin_expect(!_mm256_testz_si256(hot, hot), 0))
+      return -1;
+    const __m256i over = _mm256_subs_epu16(a, vlimit);
+    if (__builtin_expect(!_mm256_testz_si256(over, over), 1))
+      return 0;
+    vmax = _mm256_max_epu16(vmax, a);
+  }
+
+  uint16_t peak = x86_dft_hmax_epu16_256(vmax);
+  for (; k < components; k++) {
+    const int32_t x = v[k];
+    const uint16_t a = (uint16_t)(x == INT16_MIN ? 32768 : (x < 0 ? -x : x));
+    if (a >= 24576)
+      return -1;
+    if (a > positive_limit)
+      return 0;
+    if (a > peak)
+      peak = a;
+  }
+
+  int shift = 0;
+  if (((uint32_t)peak << 2) <= (uint32_t)safe_peak)
+    shift = 2;
+  else if (((uint32_t)peak << 1) <= (uint32_t)safe_peak)
+    shift = 1;
+
+  if (shift == 0)
+    return 0;
+
+  /* Evaluate coherence only after the peak scan proves that a positive
+   * shift is numerically possible. */
+  return x86_dft_adaptive_coherence_allows_positive_shift(src, N, peak) ? shift : 0;
+}
+
+typedef struct {
+  uint16_t plus2_max;
+  uint16_t plus1_max;
+  uint16_t zero_max;
+  uint8_t use_minus1_above_zero;
+} x86_dft_empirical_limits_t;
+
+/*
+ * Forward adaptive limits for every characterized DFT size N >= 512.
+ *
+ * The nine PHY-priority sizes use the conservative multi-seed thresholds.
+ * Their limits follow T / 2T / 4T exactly, with no output-gain compensation:
+ *   peak <= T   -> +2
+ *   peak <= 2T  -> +1
+ *   peak <= 4T  ->  0
+ *   otherwise   -> -1
+ *
+ * The remaining 512..12288 sizes retain the boundaries measured by the full
+ * single-seed sweep.  They are intentionally kept as explicit limits instead
+ * of forcing T/2T/4T where the sweep did not show that exact pattern.
+ *
+ * Positive shifts are always below the int16 wrap limits.
+ */
+static inline int x86_dft_empirical_limits(int N, x86_dft_empirical_limits_t *l)
+{
+#define EMP(P2, P1, P0, NEG1) \
+  do {                         \
+    l->plus2_max = (P2);       \
+    l->plus1_max = (P1);       \
+    l->zero_max = (P0);        \
+    l->use_minus1_above_zero = (NEG1); \
+    return 1;                  \
+  } while (0)
+
+  switch (N) {
+    /* Multi-seed calibrated PHY sizes. */
+    case 512:  EMP(1792, 3584,  7168, 1);
+    case 768:  EMP(2176, 4352,  8704, 1);
+    case 1024: EMP(2304, 4608,  9216, 1);
+    case 1536: EMP(2560, 5120, 10240, 1);
+    case 2048: EMP(2176, 4352,  8704, 1);
+    case 3072: EMP(2560, 5120, 10240, 1);
+    case 4096: EMP(2432, 4864,  9728, 1);
+    case 6144: EMP(2304, 4608,  9216, 1);
+    case 8192: EMP(2176, 4352,  8704, 1);
+
+    /* Full-sweep profile: +2 <= 2048, +1 <= 4096, 0 <= 8192, then -1. */
+    case 576:
+    case 1920:
+    case 2304:
+    case 12288:
+      EMP(2048, 4096, 8192, 1);
+
+    /* Full-sweep profile with no observed -1 benefit through peak 28672. */
+    case 900:
+    case 1080:
+    case 1200:
+    case 1500:
+    case 1620:
+    case 2400:
+    case 2700:
+    case 3240:
+      EMP(6144, 12288, 28672, 0);
+
+    /* Full-sweep profile: +2 <= 3072, +1 <= 6144, 0 <= 12288, then -1. */
+    case 1296:
+    case 1440:
+    case 2880:
+      EMP(3072, 6144, 12288, 1);
+
+    /* Full-sweep profile: +2 <= 6144, +1 <= 12288, 0 <= 24576, then -1. */
+    case 540:
+    case 1944:
+    case 2916:
+    case 3000:
+      EMP(6144, 12288, 24576, 1);
+
+    /* Full-sweep profile: +2 <= 1536, +1 <= 3072, 0 <= 6144, then -1. */
+    case 1152:
+    case 1728:
+      EMP(1536, 3072, 6144, 1);
+
+    /* Full-sweep profile: +2 <= 1024, +1 <= 2048, 0 <= 4096, then -1. */
+    case 600:
+    case 720:
+    case 864:
+    case 960:
+    case 2160:
+      EMP(1024, 2048, 4096, 1);
+
+    /* Full-sweep profile: +2 <= 4096, +1 <= 8192, 0 <= 16384, then -1. */
+    case 648:
+    case 972:
+    case 2592:
+      EMP(4096, 8192, 16384, 1);
+
+    /* Full-sweep N=1800 profile. */
+    case 1800:
+      EMP(4096, 8192, 20480, 1);
+
+    default:
+      break;
+  }
+
+#undef EMP
+  return 0;
+}
+
+static inline uint16_t x86_dft_input_peak_q15(const c16_t *src, int N)
+{
+  const int16_t *v = (const int16_t *)src;
+  const int components = 2 * N;
+  __m256i vmax = _mm256_setzero_si256();
+  int k = 0;
+
+  for (; k + 16 <= components; k += 16) {
+    const __m256i x = _mm256_loadu_si256((const __m256i *)(v + k));
+    vmax = _mm256_max_epu16(vmax, x86_dft_abs_sat_epi16_256(x));
+  }
+
+  uint16_t peak = x86_dft_hmax_epu16_256(vmax);
+  for (; k < components; k++) {
+    const int32_t x = v[k];
+    const uint16_t a = (uint16_t)(x == INT16_MIN ? 32768 : (x < 0 ? -x : x));
+    if (a > peak)
+      peak = a;
+  }
+  return peak;
+}
+
+static inline int x86_dft_adaptive_choose_shift(const c16_t *src, int N, uint8_t scale_flag)
+{
+  /* Keep small transforms free of adaptive-state and peak-scan overhead. */
+  if (N < 512)
+    return 0;
+  if (!x86_dft_adaptive_enabled_from_scale(scale_flag))
+    return 0;
+
+  x86_dft_empirical_limits_t l;
+  if (!x86_dft_empirical_limits(N, &l))
+    return x86_dft_adaptive_choose_shift_legacy(src, N, scale_flag);
+
+  const uint16_t peak = x86_dft_input_peak_q15(src, N);
+
+  if (peak <= l.plus2_max)
+    return 2;
+  if (peak <= l.plus1_max)
+    return 1;
+  if (peak <= l.zero_max)
+    return 0;
+  return l.use_minus1_above_zero ? -1 : 0;
+}
+
+
+/*
+ * Gain-transparent inverse adaptation, characterized with five independent
+ * input shapes for every supported IDFT size from 512 through 12288.
+ *
+ * Only positive input shifts are enabled here:
+ *   peak <= T   -> input << 2, IDFT, output >> 2
+ *   peak <= 2T  -> input << 1, IDFT, output >> 1
+ *   otherwise   -> unchanged
+ *
+ * The real integer output restoration retained a substantial EVM benefit in
+ * the characterization.  The -1 case is deliberately not enabled yet:
+ * restoring its gain requires output << 1, which overflowed for some seeds
+ * at high amplitudes and therefore is not safely gain-transparent.
+ */
+static inline uint16_t x86_idft_adaptive_threshold(int N)
+{
+  switch (N) {
+    case 600:
+    case 720:
+    case 864:
+    case 960:
+    case 1920:
+    case 2160:
+      return 1024;
+
+    case 1152:
+    case 1728:
+      return 1536;
+
+    case 512:
+    case 576:
+    case 648:
+    case 768:
+    case 1024:
+    case 1296:
+    case 1536:
+    case 2048:
+    case 2304:
+    case 2880:
+    case 3072:
+    case 4096:
+    case 6144:
+    case 8192:
+    case 12288:
+      return 2048;
+
+    case 972:
+      return 3072;
+
+    case 1440:
+    case 1500:
+    case 2592:
+      return 4096;
+
+    case 540:
+    case 900:
+    case 1080:
+    case 1200:
+    case 1620:
+    case 1800:
+    case 1944:
+    case 2400:
+    case 2700:
+    case 2916:
+    case 3000:
+    case 3240:
+      return 6144;
+
+    default:
+      return 0;
+  }
+}
+
+static inline int x86_idft_adaptive_choose_shift(const c16_t *src, int N, uint8_t scale_flag)
+{
+  if (N < 512)
+    return 0;
+  if (!x86_idft_adaptive_enabled_from_scale(scale_flag))
+    return 0;
+
+  const uint16_t T = x86_idft_adaptive_threshold(N);
+  if (!T)
+    return 0;
+
+  const uint16_t peak = x86_dft_input_peak_q15(src, N);
+  if (peak <= T)
+    return 2;
+  if (peak <= (uint16_t)(2u * T))
+    return 1;
+  return 0;
+}
+
+static inline __m256i x86_idft_round_shift_right1_256(__m256i x)
+{
+  const __m256i lsb = _mm256_and_si256(x, _mm256_set1_epi16(1));
+  return _mm256_add_epi16(_mm256_srai_epi16(x, 1), lsb);
+}
+
+static inline void x86_idft_restore_positive_gain_q15_avx2(const c16_t *src, c16_t *dst, int N, int input_shift)
+{
+  const int16_t *s = (const int16_t *)src;
+  int16_t *d = (int16_t *)dst;
+  const int components = 2 * N;
+  int k = 0;
+
+  AssertFatal(input_shift == 1 || input_shift == 2,
+              "x86 IDFT: invalid transparent restore shift %d\n",
+              input_shift);
+
+  for (; k + 64 <= components; k += 64) {
+    __m256i x0 = _mm256_loadu_si256((const __m256i *)(s + k + 0));
+    __m256i x1 = _mm256_loadu_si256((const __m256i *)(s + k + 16));
+    __m256i x2 = _mm256_loadu_si256((const __m256i *)(s + k + 32));
+    __m256i x3 = _mm256_loadu_si256((const __m256i *)(s + k + 48));
+
+    x0 = x86_idft_round_shift_right1_256(x0);
+    x1 = x86_idft_round_shift_right1_256(x1);
+    x2 = x86_idft_round_shift_right1_256(x2);
+    x3 = x86_idft_round_shift_right1_256(x3);
+    if (input_shift == 2) {
+      x0 = x86_idft_round_shift_right1_256(x0);
+      x1 = x86_idft_round_shift_right1_256(x1);
+      x2 = x86_idft_round_shift_right1_256(x2);
+      x3 = x86_idft_round_shift_right1_256(x3);
+    }
+
+    _mm256_storeu_si256((__m256i *)(d + k + 0), x0);
+    _mm256_storeu_si256((__m256i *)(d + k + 16), x1);
+    _mm256_storeu_si256((__m256i *)(d + k + 32), x2);
+    _mm256_storeu_si256((__m256i *)(d + k + 48), x3);
+  }
+
+  for (; k + 16 <= components; k += 16) {
+    __m256i x = _mm256_loadu_si256((const __m256i *)(s + k));
+    x = x86_idft_round_shift_right1_256(x);
+    if (input_shift == 2)
+      x = x86_idft_round_shift_right1_256(x);
+    _mm256_storeu_si256((__m256i *)(d + k), x);
+  }
+
+  for (; k < components; k++) {
+    int16_t v = s[k];
+    v = x86_dft_q15_shift_scalar(v, -1);
+    if (input_shift == 2)
+      v = x86_dft_q15_shift_scalar(v, -1);
+    d[k] = v;
+  }
 }
 
 static inline simde__m256i c16_mul_q15_simd256(simde__m256i x, simde__m256i w_re_negim, simde__m256i w_im_re)
@@ -429,6 +1120,7 @@ static inline void dft8_strided_q15_128(const c16_t *src, int stride, c16_t *dst
 static inline void dft16_q15_128(const c16_t *src, c16_t *dst, dft_dir_t dir);
 static inline void dft32_q15_128(const c16_t *src, c16_t *dst, dft_dir_t dir);
 static inline void dft32_q15_256_contiguous(const c16_t *src, c16_t *dst, dft_dir_t dir);
+static inline void dft32_q15_256_contiguous_shifted(const c16_t *src, c16_t *dst, dft_dir_t dir, int input_shift);
 static void dft96_radix12_pfa_leaf8(const c16_t*,c16_t*,dft_dir_t);
 static void dft120_radix15_pfa_avx2_selected(const c16_t *src, c16_t *dst, dft_dir_t dir);
 static void dft144_radix18_leaf8_avx2_selected(const c16_t *src,c16_t *dst,dft_dir_t dir);
@@ -454,6 +1146,7 @@ static void dft512_radix8_selected(const c16_t *src, c16_t *dst, dft_dir_t dir);
 static void dft1024_radix16_selected(const c16_t *src, c16_t *dst, dft_dir_t dir);
 static size_t dft_power2_mixed_large_work_len(int N);
 static void dft_power2_mixed_large_core(const c16_t *src, c16_t *dst, int N, dft_dir_t dir, c16_t *work);
+static void dft_power2_mixed_large_core_shifted(const c16_t *src, c16_t *dst, int N, dft_dir_t dir, c16_t *work, int input_shift);
 static void radix3_pow2_selected(const c16_t *src, c16_t *dst, int N, dft_dir_t dir);
 static void selected_q15_twiddles_init(void);
 
@@ -2201,21 +2894,22 @@ static inline void combine16_q15_128(const __m128i H[4], c16_t *dst, dft_dir_t d
   _mm_storeu_si128((__m128i *)(dst + 12), Y3);
 }
 
-static inline void dft16_q15_128(const c16_t *src, c16_t *dst, dft_dir_t dir)
+static inline void dft16_q15_128_shifted(const c16_t *src, c16_t *dst, dft_dir_t dir, int input_shift)
 {
   __m128i H[4] __attribute__((aligned(16)));
 
-  const __m128i x0 = _mm_loadu_si128((const __m128i *)(src + 0));
-
-  const __m128i x1 = _mm_loadu_si128((const __m128i *)(src + 4));
-
-  const __m128i x2 = _mm_loadu_si128((const __m128i *)(src + 8));
-
-  const __m128i x3 = _mm_loadu_si128((const __m128i *)(src + 12));
+  const __m128i x0 = x86_dft_shift_q15_128(_mm_loadu_si128((const __m128i *)(src + 0)), input_shift);
+  const __m128i x1 = x86_dft_shift_q15_128(_mm_loadu_si128((const __m128i *)(src + 4)), input_shift);
+  const __m128i x2 = x86_dft_shift_q15_128(_mm_loadu_si128((const __m128i *)(src + 8)), input_shift);
+  const __m128i x3 = x86_dft_shift_q15_128(_mm_loadu_si128((const __m128i *)(src + 12)), input_shift);
 
   dft4x4_q15_128(x0, x1, x2, x3, &H[0], &H[1], &H[2], &H[3], dir);
-
   combine16_q15_128(H, dst, dir);
+}
+
+static inline void dft16_q15_128(const c16_t *src, c16_t *dst, dft_dir_t dir)
+{
+  dft16_q15_128_shifted(src, dst, dir, 0);
 }
 
 /*
@@ -2268,13 +2962,11 @@ OAI_DFT_SMALL_HOT void dft16(int16_t *x, int16_t *y, uint8_t scale_flag)
 {
   const c16_t *src = (const c16_t *)x;
   c16_t *dst = (c16_t *)y;
-
-  (void)scale_flag;
-
-  dft16_q15_128(src, dst, DFT_DIR_FORWARD);
+  const int input_shift = x86_dft_adaptive_choose_shift(src, 16, scale_flag);
+  dft16_q15_128_shifted(src, dst, DFT_DIR_FORWARD, input_shift);
 }
 
-static inline void dft12_q15_128(const c16_t *src, c16_t *dst, dft_dir_t dir)
+static inline void dft12_q15_128_shifted(const c16_t *src, c16_t *dst, dft_dir_t dir, int input_shift)
 {
   /*
    * lane 0 : src[0], src[3], src[6],  src[9]
@@ -2282,10 +2974,10 @@ static inline void dft12_q15_128(const c16_t *src, c16_t *dst, dft_dir_t dir)
    * lane 2 : src[2], src[5], src[8],  src[11]
    * lane 3 : dummy
    */
-  const __m128i x0 = pack3_complex_plus_zero_c16(src[0], src[1], src[2]);
-  const __m128i x1 = pack3_complex_plus_zero_c16(src[3], src[4], src[5]);
-  const __m128i x2 = pack3_complex_plus_zero_c16(src[6], src[7], src[8]);
-  const __m128i x3 = pack3_complex_plus_zero_c16(src[9], src[10], src[11]);
+  const __m128i x0 = x86_dft_shift_q15_128(pack3_complex_plus_zero_c16(src[0], src[1], src[2]), input_shift);
+  const __m128i x1 = x86_dft_shift_q15_128(pack3_complex_plus_zero_c16(src[3], src[4], src[5]), input_shift);
+  const __m128i x2 = x86_dft_shift_q15_128(pack3_complex_plus_zero_c16(src[6], src[7], src[8]), input_shift);
+  const __m128i x3 = x86_dft_shift_q15_128(pack3_complex_plus_zero_c16(src[9], src[10], src[11]), input_shift);
 
   __m128i H0, H1, H2, H3;
 
@@ -2372,14 +3064,17 @@ static inline void dft12_q15_128(const c16_t *src, c16_t *dst, dft_dir_t dir)
   _mm_storeu_si128((__m128i *)(dst + 8), Y2);
 }
 
+static inline void dft12_q15_128(const c16_t *src, c16_t *dst, dft_dir_t dir)
+{
+  dft12_q15_128_shifted(src, dst, dir, 0);
+}
+
 OAI_DFT_SMALL_HOT void dft12(int16_t *x, int16_t *y, uint8_t scale_flag)
 {
   const c16_t *src = (const c16_t *)x;
   c16_t *dst = (c16_t *)y;
-
-  (void)scale_flag;
-
-  dft12_q15_128(src, dst, DFT_DIR_FORWARD);
+  const int input_shift = x86_dft_adaptive_choose_shift(src, 12, scale_flag);
+  dft12_q15_128_shifted(src, dst, DFT_DIR_FORWARD, input_shift);
 }
 
 static inline void dft12_q15_128_strided(const c16_t *src, int stride, c16_t *dst, dft_dir_t dir)
@@ -2731,9 +3426,7 @@ void dft32(int16_t *x, int16_t *y, uint8_t scale_flag)
 {
   const c16_t *src = (const c16_t *)x;
   c16_t *dst = (c16_t *)y;
-
   (void)scale_flag;
-
   dft32_q15_256_contiguous(src, dst, DFT_DIR_FORWARD);
 }
 
@@ -2976,7 +3669,8 @@ static inline void dft24_q15_128(const c16_t *src, c16_t *dst, dft_dir_t dir)
 void dft24(int16_t *x, int16_t *y, uint8_t scale_flag)
 {
   (void)scale_flag;
-  radix3_pow2_selected((const c16_t *)x, (c16_t *)y, 24, DFT_DIR_FORWARD);
+  const c16_t *src = (const c16_t *)x;
+  radix3_pow2_selected(src, (c16_t *)y, 24, DFT_DIR_FORWARD);
 }
 
 static inline void dft24_q15_128_strided(const c16_t *src, int stride, c16_t *dst, dft_dir_t dir)
@@ -3210,11 +3904,9 @@ static inline void dft20_q15_128(const c16_t *src, c16_t *dst, dft_dir_t dir)
 
 void dft20(int16_t *x, int16_t *y, uint8_t scale_flag)
 {
+  (void)scale_flag;
   const c16_t *src = (const c16_t *)x;
   c16_t *dst = (c16_t *)y;
-
-  (void)scale_flag;
-
   dft20_q15_128(src, dst, DFT_DIR_FORWARD);
 }
 
@@ -3666,7 +4358,7 @@ static void dft512_radix8_selected(const c16_t *src, c16_t *dst, dft_dir_t dir)
   dft64x8_selected_store(leaf, dst, 8, 0, dir);
 }
 
-static void dft1024_radix16_selected(const c16_t *src, c16_t *dst, dft_dir_t dir)
+static void dft1024_radix16_selected_shifted(const c16_t *src, c16_t *dst, dft_dir_t dir, int input_shift)
 {
   selected_q15_twiddles_init();
   const int ds = dir == DFT_DIR_FORWARD ? 0 : 1;
@@ -3678,8 +4370,8 @@ static void dft1024_radix16_selected(const c16_t *src, c16_t *dst, dft_dir_t dir
     __m256i a[8], b[8], e[8], o[8];
 
     for (int q = 0; q < 8; q++) {
-      const __m256i lo = _mm256_loadu_si256((const __m256i *)(src + q * 64 + n));
-      const __m256i hi = _mm256_loadu_si256((const __m256i *)(src + (q + 8) * 64 + n));
+      const __m256i lo = x86_dft_shift_q15_256(_mm256_loadu_si256((const __m256i *)(src + q * 64 + n)), input_shift);
+      const __m256i hi = x86_dft_shift_q15_256(_mm256_loadu_si256((const __m256i *)(src + (q + 8) * 64 + n)), input_shift);
       a[q] = _mm256_mulhrs_epi16(_mm256_adds_epi16(lo, hi), s2);
       b[q] = _mm256_mulhrs_epi16(_mm256_subs_epi16(lo, hi), s2);
       if (q)
@@ -3732,7 +4424,13 @@ static void dft1024_radix16_selected(const c16_t *src, c16_t *dst, dft_dir_t dir
   dft64x8_selected_store(leaf[1], dst, 16, 8, dir);
 }
 
-static int dft_power2_radix8_stage_large(const c16_t *src, c16_t *stage, int N, dft_dir_t dir)
+static void dft1024_radix16_selected(const c16_t *src, c16_t *dst, dft_dir_t dir)
+{
+  dft1024_radix16_selected_shifted(src, dst, dir, 0);
+}
+
+
+static int dft_power2_radix8_stage_large(const c16_t *src, c16_t *stage, int N, dft_dir_t dir, int input_shift)
 {
   power2_twiddle_t *tw = power2_twiddle_slot(N);
   if (!tw || !power2_twiddle_ensure_q15(tw, N, 8))
@@ -3747,7 +4445,7 @@ static int dft_power2_radix8_stage_large(const c16_t *src, c16_t *stage, int N, 
     const int n = 8 * b;
     __m256i x[8], y[8];
     for (int r = 0; r < 8; r++)
-      x[r] = _mm256_loadu_si256((const __m256i *)(src + r * M + n));
+      x[r] = x86_dft_shift_q15_256(_mm256_loadu_si256((const __m256i *)(src + r * M + n)), input_shift);
 
     dft8x8_q15_256_dir(x[0], x[1], x[2], x[3], x[4], x[5], x[6], x[7],
                        &y[0], &y[1], &y[2], &y[3], &y[4], &y[5], &y[6], &y[7], dir);
@@ -3761,7 +4459,7 @@ static int dft_power2_radix8_stage_large(const c16_t *src, c16_t *stage, int N, 
   return 1;
 }
 
-static int dft_power2_radix16_stage_large(const c16_t *src, c16_t *stage, int N, dft_dir_t dir)
+static int dft_power2_radix16_stage_large(const c16_t *src, c16_t *stage, int N, dft_dir_t dir, int input_shift)
 {
   selected_q15_twiddles_init();
   power2_twiddle_t *tw = power2_twiddle_slot(N);
@@ -3777,7 +4475,7 @@ static int dft_power2_radix16_stage_large(const c16_t *src, c16_t *stage, int N,
     const int n = 8 * b;
     __m256i x[16], y[16];
     for (int r = 0; r < 16; r++)
-      x[r] = _mm256_loadu_si256((const __m256i *)(src + r * M + n));
+      x[r] = x86_dft_shift_q15_256(_mm256_loadu_si256((const __m256i *)(src + r * M + n)), input_shift);
 
     dft16x8_selected(x, y, dir);
 
@@ -3798,7 +4496,7 @@ static void dft2048_radix8x16_fused_selected(const c16_t *src, c16_t *dst, dft_d
   __m256i child_in[16][16] __attribute__((aligned(64)));
 
   selected_q15_twiddles_init();
-  if (!dft_power2_radix8_stage_large(src, outer_stage, N, dir))
+  if (!dft_power2_radix8_stage_large(src, outer_stage, N, dir, 0))
     return;
 
   const int ds = dir == DFT_DIR_FORWARD ? 0 : 1;
@@ -3870,14 +4568,14 @@ static void dft2048_radix8x16_fused_selected(const c16_t *src, c16_t *dst, dft_d
   }
 }
 
-static void dft2048_radix8x16_fused_selected_w16folded(const c16_t *src, c16_t *dst, dft_dir_t dir)
+static void dft2048_radix8x16_fused_selected_w16folded_shifted(const c16_t *src, c16_t *dst, dft_dir_t dir, int input_shift)
 {
   enum { N = 2048, CHILD_N = 256, M = 16 };
   c16_t outer_stage[N] __attribute__((aligned(64)));
   __m256i child_in[16][16] __attribute__((aligned(64)));
 
   selected_q15_twiddles_init();
-  if (!dft_power2_radix8_stage_large(src, outer_stage, N, dir))
+  if (!dft_power2_radix8_stage_large(src, outer_stage, N, dir, input_shift))
     return;
 
   const int ds = dir == DFT_DIR_FORWARD ? 0 : 1;
@@ -3949,14 +4647,15 @@ static void dft2048_radix8x16_fused_selected_w16folded(const c16_t *src, c16_t *
   }
 }
 
-static void dft4096_radix8x8_fused_selected(const c16_t *src, c16_t *dst, dft_dir_t dir)
+
+static void dft4096_radix8x8_fused_selected_shifted(const c16_t *src, c16_t *dst, dft_dir_t dir, int input_shift)
 {
   enum { N = 4096, CHILD_N = 512, M = 64 };
   c16_t outer_stage[N] __attribute__((aligned(64)));
   __m256i leaf_in[8][64] __attribute__((aligned(64)));
 
   selected_q15_twiddles_init();
-  if (!dft_power2_radix8_stage_large(src, outer_stage, N, dir))
+  if (!dft_power2_radix8_stage_large(src, outer_stage, N, dir, input_shift))
     return;
 
   const int ds = dir == DFT_DIR_FORWARD ? 0 : 1;
@@ -3998,14 +4697,20 @@ static void dft4096_radix8x8_fused_selected(const c16_t *src, c16_t *dst, dft_di
     dft64x8_selected_store(leaf_in[r], dst, 64, 8 * r, dir);
 }
 
-static void dft8192_radix8x16_fused_selected(const c16_t *src, c16_t *dst, dft_dir_t dir)
+static void dft4096_radix8x8_fused_selected(const c16_t *src, c16_t *dst, dft_dir_t dir)
+{
+  dft4096_radix8x8_fused_selected_shifted(src, dst, dir, 0);
+}
+
+
+static void dft8192_radix8x16_fused_selected_shifted(const c16_t *src, c16_t *dst, dft_dir_t dir, int input_shift)
 {
   enum { N = 8192, CHILD_N = 1024, M = 64 };
   c16_t outer_stage[N] __attribute__((aligned(64)));
   __m256i leaf_in[16][64] __attribute__((aligned(64)));
 
   selected_q15_twiddles_init();
-  if (!dft_power2_radix8_stage_large(src, outer_stage, N, dir))
+  if (!dft_power2_radix8_stage_large(src, outer_stage, N, dir, input_shift))
     return;
 
   const int ds = dir == DFT_DIR_FORWARD ? 0 : 1;
@@ -4061,6 +4766,12 @@ static void dft8192_radix8x16_fused_selected(const c16_t *src, c16_t *dst, dft_d
   for (int r = 0; r < 16; r++)
     dft64x8_selected_store(leaf_in[r], dst, 128, 8 * r, dir);
 }
+
+static void dft8192_radix8x16_fused_selected(const c16_t *src, c16_t *dst, dft_dir_t dir)
+{
+  dft8192_radix8x16_fused_selected_shifted(src, dst, dir, 0);
+}
+
 
 static inline void radix8_blocked_to_natural_q15_large(const c16_t *blocked, c16_t *dst, int M)
 {
@@ -4129,7 +4840,7 @@ static size_t dft_power2_mixed_large_work_len(int N)
   return need;
 }
 
-static void dft_power2_mixed_large_core(const c16_t *src, c16_t *dst, int N, dft_dir_t dir, c16_t *work)
+static void dft_power2_mixed_large_core_shifted(const c16_t *src, c16_t *dst, int N, dft_dir_t dir, c16_t *work, int input_shift)
 {
   if (N == 256) {
     dft256_radix16_selected_w16folded(src, dst, dir);
@@ -4140,19 +4851,19 @@ static void dft_power2_mixed_large_core(const c16_t *src, c16_t *dst, int N, dft
     return;
   }
   if (N == 1024) {
-    dft1024_radix16_selected(src, dst, dir);
+    dft1024_radix16_selected_shifted(src, dst, dir, input_shift);
     return;
   }
   if (N == 2048) {
-    dft2048_radix8x16_fused_selected_w16folded(src, dst, dir);
+    dft2048_radix8x16_fused_selected_w16folded_shifted(src, dst, dir, input_shift);
     return;
   }
   if (N == 4096) {
-    dft4096_radix8x8_fused_selected(src, dst, dir);
+    dft4096_radix8x8_fused_selected_shifted(src, dst, dir, input_shift);
     return;
   }
   if (N == 8192) {
-    dft8192_radix8x16_fused_selected(src, dst, dir);
+    dft8192_radix8x16_fused_selected_shifted(src, dst, dir, input_shift);
     return;
   }
   if (N == 16384) {
@@ -4174,19 +4885,25 @@ static void dft_power2_mixed_large_core(const c16_t *src, c16_t *dst, int N, dft
   c16_t *blocked = work + N;
   c16_t *child_work = work + 2 * N;
 
-  const int ok = radix == 16 ? dft_power2_radix16_stage_large(src, stage, N, dir)
-                             : dft_power2_radix8_stage_large(src, stage, N, dir);
+  const int ok = radix == 16 ? dft_power2_radix16_stage_large(src, stage, N, dir, input_shift)
+                             : dft_power2_radix8_stage_large(src, stage, N, dir, input_shift);
   if (!ok)
     return;
 
   for (int r = 0; r < radix; r++)
-    dft_power2_mixed_large_core(stage + r * M, blocked + r * M, M, dir, child_work);
+    dft_power2_mixed_large_core_shifted(stage + r * M, blocked + r * M, M, dir, child_work, 0);
 
   if (radix == 16)
     radix16_blocked_to_natural_q15_large(blocked, dst, M);
   else
     radix8_blocked_to_natural_q15_large(blocked, dst, M);
 }
+
+static void dft_power2_mixed_large_core(const c16_t *src, c16_t *dst, int N, dft_dir_t dir, c16_t *work)
+{
+  dft_power2_mixed_large_core_shifted(src, dst, N, dir, work, 0);
+}
+
 
 static void dft_power2_mixed_large_q15(const c16_t *src, c16_t *dst, int N, dft_dir_t dir)
 {
@@ -4205,6 +4922,29 @@ static void dft_power2_mixed_large_q15(const c16_t *src, c16_t *dst, int N, dft_
   if (!work)
     return;
   dft_power2_mixed_large_core(src, dst, N, dir, work);
+}
+
+static void dft_power2_mixed_large_q15_shifted(const c16_t *src, c16_t *dst, int N, dft_dir_t dir, int input_shift)
+{
+  if (!input_shift) {
+    dft_power2_mixed_large_q15(src, dst, N, dir);
+    return;
+  }
+  if (N == 16384 || N > DFT_C16_SR_MAX_N) {
+    /* Split-radix root packing uses a different input access pattern, so
+     * scale the input into adaptive scratch before dispatch. */
+    c16_t *scaled = x86_dft_tls_adaptive_work((size_t)N);
+    if (!scaled)
+      return;
+    x86_dft_shift_copy_q15_avx2(src, scaled, N, input_shift);
+    dft_power2_mixed_large_q15(scaled, dst, N, dir);
+    return;
+  }
+  const size_t need = dft_power2_mixed_large_work_len(N);
+  c16_t *work = need ? x86_dft_tls_work(need) : NULL;
+  if (need && !work)
+    return;
+  dft_power2_mixed_large_core_shifted(src, dst, N, dir, work, input_shift);
 }
 
 static void dft_power2_mixed_large_q15_strided(const c16_t *src, int stride, c16_t *dst, int N, dft_dir_t dir)
@@ -4237,13 +4977,13 @@ static void dft_power2_mixed_large_q15_strided(const c16_t *src, int stride, c16
   dft_power2_mixed_large_core(mem, dst, N, dir, mem + N);
 }
 
-static inline void pack_radix3_selected(const c16_t *src, c16_t *packed, int size)
+static inline void pack_radix3_selected_shifted(const c16_t *src, c16_t *packed, int size, int input_shift)
 {
   int n = 0;
   for (; n + 3 < size; n += 4) {
-    const __m128 l0 = _mm_castsi128_ps(_mm_loadu_si128((const __m128i *)(src + 3 * n)));
-    const __m128 l1 = _mm_castsi128_ps(_mm_loadu_si128((const __m128i *)(src + 3 * n + 4)));
-    const __m128 l2 = _mm_castsi128_ps(_mm_loadu_si128((const __m128i *)(src + 3 * n + 8)));
+    const __m128 l0 = _mm_castsi128_ps(x86_dft_shift_q15_128(_mm_loadu_si128((const __m128i *)(src + 3 * n)), input_shift));
+    const __m128 l1 = _mm_castsi128_ps(x86_dft_shift_q15_128(_mm_loadu_si128((const __m128i *)(src + 3 * n + 4)), input_shift));
+    const __m128 l2 = _mm_castsi128_ps(x86_dft_shift_q15_128(_mm_loadu_si128((const __m128i *)(src + 3 * n + 8)), input_shift));
 
     const __m128 a01 = _mm_shuffle_ps(l0, l0, _MM_SHUFFLE(3, 0, 3, 0));
     const __m128 a23 = _mm_shuffle_ps(l1, l2, _MM_SHUFFLE(1, 1, 2, 2));
@@ -4257,11 +4997,15 @@ static inline void pack_radix3_selected(const c16_t *src, c16_t *packed, int siz
     _mm_storeu_si128((__m128i *)(packed + 2 * size + n), _mm_castps_si128(_mm_shuffle_ps(c01, c23, _MM_SHUFFLE(2, 0, 2, 0))));
   }
   for (; n < size; n++) {
-    packed[n] = src[3 * n];
-    packed[size + n] = src[3 * n + 1];
-    packed[2 * size + n] = src[3 * n + 2];
+    packed[n].r = x86_dft_q15_shift_scalar(src[3 * n].r, input_shift);
+    packed[n].i = x86_dft_q15_shift_scalar(src[3 * n].i, input_shift);
+    packed[size + n].r = x86_dft_q15_shift_scalar(src[3 * n + 1].r, input_shift);
+    packed[size + n].i = x86_dft_q15_shift_scalar(src[3 * n + 1].i, input_shift);
+    packed[2 * size + n].r = x86_dft_q15_shift_scalar(src[3 * n + 2].r, input_shift);
+    packed[2 * size + n].i = x86_dft_q15_shift_scalar(src[3 * n + 2].i, input_shift);
   }
 }
+
 
 static inline void radix3_combine4_q15_128_fast(__m128i A,
                                                 __m128i X1,
@@ -4571,12 +5315,13 @@ static inline void radix9_stage_to_branch_major_q15_256_288(const c16_t *src,
 }
 
 /* AVX2 R9 parent for selected sizes with M divisible by eight. */
-static inline void radix9_stage_to_branch_major_q15_256_selected(const c16_t *src,
+static inline void radix9_stage_to_branch_major_q15_256_selected_shifted(const c16_t *src,
                                                                    c16_t *b,
                                                                    int N,
                                                                    dft_dir_t dir,
                                                                    const r3_twiddle_t *twB,
-                                                                   const r3_twiddle_t *twA)
+                                                                   const r3_twiddle_t *twA,
+                                                                   int input_shift)
 {
   const int M = N / 9;
 
@@ -4597,9 +5342,9 @@ static inline void radix9_stage_to_branch_major_q15_256_selected(const c16_t *sr
       const int first_off = (AIDX) * M + off;                                                      \
       const int tidx = first_off >> 2;                                                             \
       __m256i z0, z1, z2;                                                                          \
-      radix3_butterfly8_q15_256(_mm256_loadu_si256((const __m256i *)(src + ((AIDX) + 0) * M + off)), \
-                                 _mm256_loadu_si256((const __m256i *)(src + ((AIDX) + 3) * M + off)), \
-                                 _mm256_loadu_si256((const __m256i *)(src + ((AIDX) + 6) * M + off)), \
+      radix3_butterfly8_q15_256(x86_dft_shift_q15_256(_mm256_loadu_si256((const __m256i *)(src + ((AIDX) + 0) * M + off)), input_shift), \
+                                 x86_dft_shift_q15_256(_mm256_loadu_si256((const __m256i *)(src + ((AIDX) + 3) * M + off)), input_shift), \
+                                 x86_dft_shift_q15_256(_mm256_loadu_si256((const __m256i *)(src + ((AIDX) + 6) * M + off)), input_shift), \
                                  &z0, &z1, &z2, dir);                                               \
       (O0) = _mm256_mulhrs_epi16(z0, _mm256_set1_epi16(Q15_INV_SQRT3));                           \
       (O1) = complex_mul8_prepack_q15_256(z1,                                                      \
@@ -4642,16 +5387,22 @@ static inline void radix9_stage_to_branch_major_q15_256_selected(const c16_t *sr
   }
 }
 
+static inline void radix9_stage_to_branch_major_q15_256_selected(const c16_t *src, c16_t *b, int N, dft_dir_t dir, const r3_twiddle_t *twB, const r3_twiddle_t *twA)
+{
+  radix9_stage_to_branch_major_q15_256_selected_shifted(src, b, N, dir, twB, twA, 0);
+}
+
 
 /* DFT576 parent R9 output directly in the lane-major format consumed by
  * the eight-way DFT64 child kernel. Branch 8 remains contiguous for the
  * standalone DFT64 tail. */
-static inline void radix9_stage_to_dft64x8_576(const c16_t *src,
+static inline void radix9_stage_to_dft64x8_576_shifted(const c16_t *src,
                                                 __m256i leaf[64],
                                                 c16_t branch8[64],
                                                 dft_dir_t dir,
                                                 const r3_twiddle_t *twB,
-                                                const r3_twiddle_t *twA)
+                                                const r3_twiddle_t *twA,
+                                                int input_shift)
 {
   enum { M = 64 };
 
@@ -4672,9 +5423,9 @@ static inline void radix9_stage_to_dft64x8_576(const c16_t *src,
       const int first_off = (AIDX) * M + off;                                                      \
       const int tidx = first_off >> 2;                                                             \
       __m256i z0, z1, z2;                                                                          \
-      radix3_butterfly8_q15_256(_mm256_loadu_si256((const __m256i *)(src + ((AIDX) + 0) * M + off)), \
-                                 _mm256_loadu_si256((const __m256i *)(src + ((AIDX) + 3) * M + off)), \
-                                 _mm256_loadu_si256((const __m256i *)(src + ((AIDX) + 6) * M + off)), \
+      radix3_butterfly8_q15_256(x86_dft_shift_q15_256(_mm256_loadu_si256((const __m256i *)(src + ((AIDX) + 0) * M + off)), input_shift), \
+                                 x86_dft_shift_q15_256(_mm256_loadu_si256((const __m256i *)(src + ((AIDX) + 3) * M + off)), input_shift), \
+                                 x86_dft_shift_q15_256(_mm256_loadu_si256((const __m256i *)(src + ((AIDX) + 6) * M + off)), input_shift), \
                                  &z0, &z1, &z2, dir);                                               \
       (O0) = _mm256_mulhrs_epi16(z0, _mm256_set1_epi16(Q15_INV_SQRT3));                           \
       (O1) = complex_mul8_prepack_q15_256(z1,                                                      \
@@ -4725,6 +5476,7 @@ static inline void radix9_stage_to_dft64x8_576(const c16_t *src,
     _mm256_store_si256((__m256i *)(branch8 + off), r8);
   }
 }
+
 
 /* Dedicated N=972 outer R9 hybrid. M=108 is 13*8+4, so run the
  * lane-independent AVX2 arithmetic for offsets 0..103 and finish the last
@@ -4991,12 +5743,12 @@ static inline void dft4x4_q15_256x2(const __m256i x0,
   *Y3 = _mm256_adds_epi16(d02, mul_plus_j_dir_i16_256(d13, dir));
 }
 
-static inline void dft32_q15_256_contiguous(const c16_t *src, c16_t *dst, dft_dir_t dir)
+static inline void dft32_q15_256_contiguous_shifted(const c16_t *src, c16_t *dst, dft_dir_t dir, int input_shift)
 {
-  const __m256i x0 = _mm256_loadu_si256((const __m256i *)(src + 0));
-  const __m256i x1 = _mm256_loadu_si256((const __m256i *)(src + 8));
-  const __m256i x2 = _mm256_loadu_si256((const __m256i *)(src + 16));
-  const __m256i x3 = _mm256_loadu_si256((const __m256i *)(src + 24));
+  const __m256i x0 = x86_dft_shift_q15_256(_mm256_loadu_si256((const __m256i *)(src + 0)), input_shift);
+  const __m256i x1 = x86_dft_shift_q15_256(_mm256_loadu_si256((const __m256i *)(src + 8)), input_shift);
+  const __m256i x2 = x86_dft_shift_q15_256(_mm256_loadu_si256((const __m256i *)(src + 16)), input_shift);
+  const __m256i x3 = x86_dft_shift_q15_256(_mm256_loadu_si256((const __m256i *)(src + 24)), input_shift);
 
   __m256i H0, H1, H2, H3;
   dft4x4_q15_256x2(x0, x1, x2, x3, &H0, &H1, &H2, &H3, dir);
@@ -5035,6 +5787,12 @@ static inline void dft32_q15_256_contiguous(const c16_t *src, c16_t *dst, dft_di
   _mm_storeu_si128((__m128i *)(dst + 20), Y5);
   _mm_storeu_si128((__m128i *)(dst + 24), Y6);
   _mm_storeu_si128((__m128i *)(dst + 28), Y7);
+}
+
+
+static inline void dft32_q15_256_contiguous(const c16_t *src, c16_t *dst, dft_dir_t dir)
+{
+  dft32_q15_256_contiguous_shifted(src, dst, dir, 0);
 }
 
 
@@ -5598,7 +6356,7 @@ static __attribute__((always_inline)) inline void radix81_dft8x8_parent_store(co
     _mm256_storeu_si256((__m256i *)(dst + 81 * k + parent_branch), y[k]);
 }
 
-static void radix81_terminal_leaf8_direct(const c16_t *src, c16_t *dst, dft_dir_t dir)
+static void radix81_terminal_leaf8_direct_shifted(const c16_t *src, c16_t *dst, dft_dir_t dir, int input_shift)
 {
   enum { N = 648, M1 = 72, M2 = 8 };
   c16_t work[2 * N] __attribute__((aligned(64)));
@@ -5609,7 +6367,7 @@ static void radix81_terminal_leaf8_direct(const c16_t *src, c16_t *dst, dft_dir_
   const radix9_plan_t *outer_plan = radix9_plan_get(N);
   const radix9_plan_t *inner_plan = radix9_plan_get(M1);
   AssertFatal(outer_plan && inner_plan, "Missing radix-81 direct plans N=%d M1=%d\n", N, M1);
-  radix9_stage_to_branch_major_q15_256_selected(src, outer_b, N, dir, r3_twiddle_slot(N), r3_twiddle_slot(N / 3));
+  radix9_stage_to_branch_major_q15_256_selected_shifted(src, outer_b, N, dir, r3_twiddle_slot(N), r3_twiddle_slot(N / 3), input_shift);
   for (int outer = 0; outer < 9; outer++)
     radix9_stage_to_branch_major_q15_256_selected(outer_b + outer * M1,
                                                    stage2 + outer * M1,
@@ -5637,8 +6395,13 @@ static void radix81_terminal_leaf8_direct(const c16_t *src, c16_t *dst, dft_dir_
   }
 }
 
+static void radix81_terminal_leaf8_direct(const c16_t *src, c16_t *dst, dft_dir_t dir)
+{
+  radix81_terminal_leaf8_direct_shifted(src, dst, dir, 0);
+}
 
-static void radix81_terminal_leaf16_direct_w16folded(const c16_t *src, c16_t *dst, dft_dir_t dir)
+
+static void radix81_terminal_leaf16_direct_w16folded_shifted(const c16_t *src, c16_t *dst, dft_dir_t dir, int input_shift)
 {
   enum { N = 1296, M1 = 144, M2 = 16 };
   c16_t work[2 * N] __attribute__((aligned(64)));
@@ -5649,7 +6412,7 @@ static void radix81_terminal_leaf16_direct_w16folded(const c16_t *src, c16_t *ds
   const radix9_plan_t *outer_plan = radix9_plan_get(N);
   const radix9_plan_t *inner_plan = radix9_plan_get(M1);
   AssertFatal(outer_plan && inner_plan, "Missing radix-81 direct plans N=%d M1=%d\n", N, M1);
-  radix9_stage_to_branch_major_q15_256_selected(src, outer_b, N, dir, r3_twiddle_slot(N), r3_twiddle_slot(N / 3));
+  radix9_stage_to_branch_major_q15_256_selected_shifted(src, outer_b, N, dir, r3_twiddle_slot(N), r3_twiddle_slot(N / 3), input_shift);
   for (int outer = 0; outer < 9; outer++)
     radix9_stage_to_branch_major_q15_256_selected(outer_b + outer * M1,
                                                    stage2 + outer * M1,
@@ -5724,7 +6487,13 @@ static void radix81_terminal_leaf16_direct_w16folded(const c16_t *src, c16_t *ds
   }
 }
 
-static void radix81_terminal_leaf32_direct_2592(const c16_t *src, c16_t *dst, dft_dir_t dir)
+static void radix81_terminal_leaf16_direct_w16folded(const c16_t *src, c16_t *dst, dft_dir_t dir)
+{
+  radix81_terminal_leaf16_direct_w16folded_shifted(src, dst, dir, 0);
+}
+
+
+static void radix81_terminal_leaf32_direct_2592_shifted(const c16_t *src, c16_t *dst, dft_dir_t dir, int input_shift)
 {
   enum { N = 2592, M1 = 288, M2 = 32 };
   c16_t work[2 * N] __attribute__((aligned(64)));
@@ -5736,12 +6505,13 @@ static void radix81_terminal_leaf32_direct_2592(const c16_t *src, c16_t *dst, df
   const radix9_plan_t *inner_plan = radix9_plan_get(M1);
   AssertFatal(outer_plan && inner_plan, "Missing radix-81 direct plans N=%d M1=%d\n", N, M1);
 
-  radix9_stage_to_branch_major_q15_256_selected(src,
+  radix9_stage_to_branch_major_q15_256_selected_shifted(src,
                                                  outer_b,
                                                  N,
                                                  dir,
                                                  r3_twiddle_slot(N),
-                                                 r3_twiddle_slot(N / 3));
+                                                 r3_twiddle_slot(N / 3),
+                                                 input_shift);
 
   for (int outer = 0; outer < 9; outer++)
     radix9_stage_to_branch_major_q15_256_selected(outer_b + outer * M1,
@@ -5771,6 +6541,12 @@ static void radix81_terminal_leaf32_direct_2592(const c16_t *src, c16_t *dst, df
       dst[81 * k + branch + 8] = tail[k];
   }
 }
+
+static void radix81_terminal_leaf32_direct_2592(const c16_t *src, c16_t *dst, dft_dir_t dir)
+{
+  radix81_terminal_leaf32_direct_2592_shifted(src, dst, dir, 0);
+}
+
 
 static void radix81_terminal_leaf12_direct_972(const c16_t*src,c16_t*dst,dft_dir_t dir)
 {
@@ -5889,7 +6665,7 @@ static void radix81_selected(const c16_t *src, c16_t *dst, int N, dft_dir_t dir)
 /* Size-specific dispatcher for transforms whose generic family is radix-9.
  * N=1152 uses the dedicated radix-18 decomposition; the remaining supported
  * sizes keep their radix-9 parent paths. */
-static void dispatch_selected_radix9_radix18(const c16_t *src, c16_t *dst, int N, dft_dir_t dir)
+static void dispatch_selected_radix9_radix18_shifted(const c16_t *src, c16_t *dst, int N, dft_dir_t dir, int input_shift)
 {
   const int M = N / 9;
   AssertFatal((N % 9) == 0 && (M & 3) == 0, "Invalid radix-9 selected N=%d M=%d\n", N, M);
@@ -5909,7 +6685,7 @@ static void dispatch_selected_radix9_radix18(const c16_t *src, c16_t *dst, int N
     c16_t branch8[64] __attribute__((aligned(64)));
     c16_t tail[64] __attribute__((aligned(64)));
 
-    radix9_stage_to_dft64x8_576(src, leaf, branch8, dir, r3_twiddle_slot(N), r3_twiddle_slot(N / 3));
+    radix9_stage_to_dft64x8_576_shifted(src, leaf, branch8, dir, r3_twiddle_slot(N), r3_twiddle_slot(N / 3), input_shift);
 
     selected_q15_twiddles_init();
     const __m256i dc = dft64x8_dc_q15_256(leaf);
@@ -5927,7 +6703,7 @@ static void dispatch_selected_radix9_radix18(const c16_t *src, c16_t *dst, int N
   c16_t *y = work + N;
 
   if (N == 1152 || N == 2304)
-    radix9_stage_to_branch_major_q15_256_selected(src, b, N, dir, r3_twiddle_slot(N), r3_twiddle_slot(N / 3));
+    radix9_stage_to_branch_major_q15_256_selected_shifted(src, b, N, dir, r3_twiddle_slot(N), r3_twiddle_slot(N / 3), input_shift);
   else
     radix9_stage_to_branch_major_q15_128_plan(src, b, N, dir, r3_twiddle_slot(N), r3_twiddle_slot(N / 3));
 
@@ -5946,6 +6722,12 @@ static void dispatch_selected_radix9_radix18(const c16_t *src, c16_t *dst, int N
       radix9_scatter4_q15_128(y, dst, M, k);
   }
 }
+
+static void dispatch_selected_radix9_radix18(const c16_t *src, c16_t *dst, int N, dft_dir_t dir)
+{
+  dispatch_selected_radix9_radix18_shifted(src, dst, N, dir, 0);
+}
+
 
 static inline void dft_power2_selected_child(const c16_t *src, c16_t *dst, int N, dft_dir_t dir, c16_t *work)
 {
@@ -6169,8 +6951,9 @@ static __attribute__((always_inline)) inline void dft1152_radix9x8(__m256i x[9],
 
 static pthread_mutex_t dft1152_radix18_twiddle_mutex=PTHREAD_MUTEX_INITIALIZER;static int dft1152_radix18_twiddle_ready;static __m256i dft1152_radix18_twiddle_re[2][8][18] __attribute__((aligned(64))),dft1152_radix18_twiddle_im[2][8][18] __attribute__((aligned(64)));
 static void dft1152_radix18_twiddles_init(void){if(__builtin_expect(__atomic_load_n(&dft1152_radix18_twiddle_ready,__ATOMIC_ACQUIRE),1))return;pthread_mutex_lock(&dft1152_radix18_twiddle_mutex);if(__atomic_load_n(&dft1152_radix18_twiddle_ready,__ATOMIC_RELAXED)){pthread_mutex_unlock(&dft1152_radix18_twiddle_mutex);return;}const float sc=1.0f/sqrtf(18.0f);for(int ds=0;ds<2;ds++){const dft_dir_t dir=ds==0?DFT_DIR_FORWARD:DFT_DIR_INVERSE;for(int bl=0;bl<8;bl++){int off=8*bl;for(int br=0;br<18;br++){dft1152_radix18_twiddle_re[ds][bl][br]=pack8_twiddle_q15_re_re_scaled(off,br,1152,sc);dft1152_radix18_twiddle_im[ds][bl][br]=pack8_twiddle_q15_im_signed_scaled(off,br,1152,sc,dir);}}}__atomic_store_n(&dft1152_radix18_twiddle_ready,1,__ATOMIC_RELEASE);pthread_mutex_unlock(&dft1152_radix18_twiddle_mutex);}
-static inline void dft1152_radix18_stage(const c16_t*src,c16_t*b,dft_dir_t dir){enum{M=64};const int ds=dir==DFT_DIR_FORWARD?0:1;dft1152_radix18_twiddles_init();static const int i0[9]={0,10,2,12,4,14,6,16,8},i1[9]={9,1,11,3,13,5,15,7,17};for(int off=0;off<M;off+=8){__m256i x0[9],x1[9],s0[9],s1[9];for(int j=0;j<9;j++){x0[j]=_mm256_loadu_si256((const __m256i*)(src+i0[j]*M+off));x1[j]=_mm256_loadu_si256((const __m256i*)(src+i1[j]*M+off));}dft1152_radix9x8(x0,s0,dir);dft1152_radix9x8(x1,s1,dir);for(int k=0;k<9;k++){int b0=2*k,b1=(9+2*k)%18;__m256i z0=_mm256_adds_epi16(s0[k],s1[k]),z1=_mm256_subs_epi16(s0[k],s1[k]);__m256i v0=b0==0?_mm256_mulhrs_epi16(z0,_mm256_set1_epi16(Q15_INV_SQRT18)):complex_mul8_prepack_q15_256(z0,dft1152_radix18_twiddle_re[ds][off>>3][b0],dft1152_radix18_twiddle_im[ds][off>>3][b0]);__m256i v1=complex_mul8_prepack_q15_256(z1,dft1152_radix18_twiddle_re[ds][off>>3][b1],dft1152_radix18_twiddle_im[ds][off>>3][b1]);_mm256_store_si256((__m256i*)(b+b0*M+off),v0);_mm256_store_si256((__m256i*)(b+b1*M+off),v1);}}}
-static void dft1152_radix18_leaf64_avx2_selected(const c16_t*src,c16_t*dst,dft_dir_t dir){enum{M=64};c16_t b[18*M] __attribute__((aligned(64)));dft1152_radix18_stage(src,b,dir);dft64x8_branch_major_store(b,M,dst,18,0,dir);dft64x8_branch_major_store(b,M,dst,18,8,dir);c16_t tail[64] __attribute__((aligned(64)));for(int br=16;br<18;br++){dft64_avx(b+br*M,tail,dir);for(int k=0;k<M;k++)dst[18*k+br]=tail[k];}}
+static inline void dft1152_radix18_stage_shifted(const c16_t*src,c16_t*b,dft_dir_t dir,int input_shift){enum{M=64};const int ds=dir==DFT_DIR_FORWARD?0:1;dft1152_radix18_twiddles_init();static const int i0[9]={0,10,2,12,4,14,6,16,8},i1[9]={9,1,11,3,13,5,15,7,17};for(int off=0;off<M;off+=8){__m256i x0[9],x1[9],s0[9],s1[9];for(int j=0;j<9;j++){x0[j]=x86_dft_shift_q15_256(_mm256_loadu_si256((const __m256i*)(src+i0[j]*M+off)),input_shift);x1[j]=x86_dft_shift_q15_256(_mm256_loadu_si256((const __m256i*)(src+i1[j]*M+off)),input_shift);}dft1152_radix9x8(x0,s0,dir);dft1152_radix9x8(x1,s1,dir);for(int k=0;k<9;k++){int b0=2*k,b1=(9+2*k)%18;__m256i z0=_mm256_adds_epi16(s0[k],s1[k]),z1=_mm256_subs_epi16(s0[k],s1[k]);__m256i v0=b0==0?_mm256_mulhrs_epi16(z0,_mm256_set1_epi16(Q15_INV_SQRT18)):complex_mul8_prepack_q15_256(z0,dft1152_radix18_twiddle_re[ds][off>>3][b0],dft1152_radix18_twiddle_im[ds][off>>3][b0]);__m256i v1=complex_mul8_prepack_q15_256(z1,dft1152_radix18_twiddle_re[ds][off>>3][b1],dft1152_radix18_twiddle_im[ds][off>>3][b1]);_mm256_store_si256((__m256i*)(b+b0*M+off),v0);_mm256_store_si256((__m256i*)(b+b1*M+off),v1);}}}
+static void dft1152_radix18_leaf64_avx2_selected_shifted(const c16_t*src,c16_t*dst,dft_dir_t dir,int input_shift){enum{M=64};c16_t b[18*M] __attribute__((aligned(64)));dft1152_radix18_stage_shifted(src,b,dir,input_shift);dft64x8_branch_major_store(b,M,dst,18,0,dir);dft64x8_branch_major_store(b,M,dst,18,8,dir);c16_t tail[64] __attribute__((aligned(64)));for(int br=16;br<18;br++){dft64_avx(b+br*M,tail,dir);for(int k=0;k<M;k++)dst[18*k+br]=tail[k];}}
+static void dft1152_radix18_leaf64_avx2_selected(const c16_t*src,c16_t*dst,dft_dir_t dir){dft1152_radix18_leaf64_avx2_selected_shifted(src,dst,dir,0);}
 
 
 /* DFT96: true R12 PFA, M=8. */
@@ -6350,26 +7133,582 @@ static void dft864_r27_tw_init(void){if(__builtin_expect(__atomic_load_n(&dft864
 static inline void radix27_stage_864(const c16_t *src,c16_t *b,dft_dir_t dir){enum{M=32};const int ds=dir==DFT_DIR_FORWARD?0:1;dft864_r27_tw_init();for(int off=0;off<M;off+=8){__m256i z[27];r27_raw8_n864(src,M,off,z,dir);for(int br=0;br<27;br++){__m256i v=br==0?_mm256_mulhrs_epi16(z[br],_mm256_set1_epi16(Q15_INV_SQRT27)):complex_mul8_prepack_q15_256(z[br],dft864_r27_re[ds][off>>3][br],dft864_r27_im[ds][off>>3][br]);_mm256_store_si256((__m256i*)(b+br*M+off),v);}}}
 static void dft864_radix27_leaf32_avx2_selected(const c16_t *src,c16_t *dst,dft_dir_t dir){enum{R=27,M=32};c16_t b[R*M] __attribute__((aligned(64)));radix27_stage_864(src,b,dir);dft32x8_twiddle_scaled_store(b,M,dst,R,0,8,dir);dft32x8_twiddle_scaled_store(b,M,dst,R,8,8,dir);dft32x8_twiddle_scaled_store(b,M,dst,R,16,8,dir);dft32x8_twiddle_scaled_store(b,M,dst,R,24,3,dir);}
 
+/* DFT1536-specific wide radix-3.
+ *
+ * The generic Q15 radix-3 performs its add/sub chain in int16 with
+ * saturation.  In the R24 parent of DFT1536 this can overflow before the
+ * parent 1/sqrt(24) normalization is applied.  Keep the full radix-3
+ * arithmetic in int32, apply the unitary radix-3 factor 1/sqrt(3), then
+ * narrow once.  The parent twiddle stage consequently carries the remaining
+ * 1/sqrt(8), so the total normalization is unchanged:
+ *
+ *       (1/sqrt(3)) * (1/sqrt(8)) = 1/sqrt(24).
+ */
+static __attribute__((always_inline)) inline __m256i dft1536_q15_mul_i32(__m256i x, int16_t q15)
+{
+  const __m256i p = _mm256_mullo_epi32(x, _mm256_set1_epi32((int)q15));
+  return _mm256_srai_epi32(_mm256_add_epi32(p, _mm256_set1_epi32(1 << 14)), 15);
+}
+
+static __attribute__((always_inline)) inline __m256i dft1536_mul_minus_j_i32_256(__m256i z)
+{
+  const __m256i swapped = _mm256_shuffle_epi32(z, _MM_SHUFFLE(2, 3, 0, 1));
+  const __m256i sign = _mm256_setr_epi32(+1, -1, +1, -1, +1, -1, +1, -1);
+  return _mm256_sign_epi32(swapped, sign);
+}
+
+static __attribute__((always_inline)) inline __m256i dft1536_mul_j_i32_256(__m256i z)
+{
+  const __m256i swapped = _mm256_shuffle_epi32(z, _MM_SHUFFLE(2, 3, 0, 1));
+  const __m256i sign = _mm256_setr_epi32(-1, +1, -1, +1, -1, +1, -1, +1);
+  return _mm256_sign_epi32(swapped, sign);
+}
+
+static __attribute__((always_inline)) inline __m256i dft1536_mul_minus_j_dir_i32_256(__m256i z, dft_dir_t dir)
+{
+  return dir == DFT_DIR_FORWARD ? dft1536_mul_minus_j_i32_256(z) : dft1536_mul_j_i32_256(z);
+}
+
+static __attribute__((always_inline)) inline __m256i dft1536_mul_plus_j_dir_i32_256(__m256i z, dft_dir_t dir)
+{
+  return dir == DFT_DIR_FORWARD ? dft1536_mul_j_i32_256(z) : dft1536_mul_minus_j_i32_256(z);
+}
+
+static __attribute__((always_inline)) inline __m256i dft1536_pack_i32_to_i16(__m256i lo, __m256i hi)
+{
+  /* packs_epi32 packs independently in each 128-bit lane.  Reorder the
+   * resulting 64-bit chunks from [lo0..3 hi0..3 lo4..7 hi4..7] to the
+   * original [lo0..7 hi0..7] sample order. */
+  const __m256i p = _mm256_packs_epi32(lo, hi);
+  return _mm256_permute4x64_epi64(p, _MM_SHUFFLE(3, 1, 2, 0));
+}
+
+static __attribute__((always_inline)) inline void dft1536_radix3_half_scaled_wide(__m128i x0_16,
+                                                                                   __m128i x1_16,
+                                                                                   __m128i x2_16,
+                                                                                   __m256i *y0,
+                                                                                   __m256i *y1,
+                                                                                   __m256i *y2,
+                                                                                   dft_dir_t dir)
+{
+  const __m256i x0 = _mm256_cvtepi16_epi32(x0_16);
+  const __m256i x1 = _mm256_cvtepi16_epi32(x1_16);
+  const __m256i x2 = _mm256_cvtepi16_epi32(x2_16);
+
+  const __m256i sum = _mm256_add_epi32(x1, x2);
+  const __m256i diff = _mm256_sub_epi32(x1, x2);
+  const __m256i base = _mm256_sub_epi32(x0, dft1536_q15_mul_i32(sum, Q15_HALF));
+  const __m256i imag = dft1536_q15_mul_i32(diff, Q15_HALF_SQRT3);
+
+  const __m256i r0 = _mm256_add_epi32(x0, sum);
+  const __m256i r1 = _mm256_add_epi32(base, dft1536_mul_minus_j_dir_i32_256(imag, dir));
+  const __m256i r2 = _mm256_add_epi32(base, dft1536_mul_plus_j_dir_i32_256(imag, dir));
+
+  *y0 = dft1536_q15_mul_i32(r0, Q15_INV_SQRT3);
+  *y1 = dft1536_q15_mul_i32(r1, Q15_INV_SQRT3);
+  *y2 = dft1536_q15_mul_i32(r2, Q15_INV_SQRT3);
+}
+
+static __attribute__((always_inline)) inline void dft1536_radix3_butterfly8_q15_256_scaled_wide(__m256i x0,
+                                                                                                 __m256i x1,
+                                                                                                 __m256i x2,
+                                                                                                 __m256i *y0,
+                                                                                                 __m256i *y1,
+                                                                                                 __m256i *y2,
+                                                                                                 dft_dir_t dir)
+{
+  __m256i y0_lo, y1_lo, y2_lo;
+  __m256i y0_hi, y1_hi, y2_hi;
+
+  dft1536_radix3_half_scaled_wide(_mm256_castsi256_si128(x0),
+                                   _mm256_castsi256_si128(x1),
+                                   _mm256_castsi256_si128(x2),
+                                   &y0_lo, &y1_lo, &y2_lo, dir);
+  dft1536_radix3_half_scaled_wide(_mm256_extracti128_si256(x0, 1),
+                                   _mm256_extracti128_si256(x1, 1),
+                                   _mm256_extracti128_si256(x2, 1),
+                                   &y0_hi, &y1_hi, &y2_hi, dir);
+
+  *y0 = dft1536_pack_i32_to_i16(y0_lo, y0_hi);
+  *y1 = dft1536_pack_i32_to_i16(y1_lo, y1_hi);
+  *y2 = dft1536_pack_i32_to_i16(y2_lo, y2_hi);
+}
+
 /* Compute one AVX2 block of the radix-24 parent as a 3 x 8 PFA.
  * The fixed input index table performs the coprime 3/8 permutation, the
  * eight-point transforms are evaluated first, and the radix-3 butterflies
- * produce the 24 parent branches. The final assignments implement the
- * corresponding output permutation. No parent normalization is applied here. */
-static inline void radix24_pfa_raw8_q15_256(const c16_t*src,int M,int off,__m256i y[24],dft_dir_t dir){static const int ids[3][8]={{0,9,18,3,12,21,6,15},{16,1,10,19,4,13,22,7},{8,17,2,11,20,5,14,23}};__m256i s[3][8];for(int n=0;n<3;n++){__m256i x[8];for(int j=0;j<8;j++)x[j]=_mm256_loadu_si256((const __m256i*)(src+ids[n][j]*M+off));dft8x8_q15_256_dir(x[0],x[1],x[2],x[3],x[4],x[5],x[6],x[7],&s[n][0],&s[n][1],&s[n][2],&s[n][3],&s[n][4],&s[n][5],&s[n][6],&s[n][7],dir);}for(int k=0;k<8;k++){__m256i z0,z1,z2;radix3_butterfly8_q15_256(s[0][k],s[1][k],s[2][k],&z0,&z1,&z2,dir);y[(3*k)%24]=z0;y[(8+3*k)%24]=z1;y[(16+3*k)%24]=z2;}}
+ * produce the 24 parent branches. The wide radix-3 stage applies 1/sqrt(3)
+ * before narrowing back to int16; callers therefore carry only the remaining
+ * 1/sqrt(8) parent normalization. The final assignments implement the
+ * corresponding output permutation. */
+static inline void radix24_pfa_raw8_q15_256_shifted(const c16_t *src, int M, int off, __m256i y[24], dft_dir_t dir, int input_shift)
+{
+  static const int ids[3][8] = {{0,9,18,3,12,21,6,15},{16,1,10,19,4,13,22,7},{8,17,2,11,20,5,14,23}};
+  __m256i s[3][8];
+  for (int n = 0; n < 3; n++) {
+    __m256i x[8];
+    for (int j = 0; j < 8; j++)
+      x[j] = x86_dft_shift_q15_256(_mm256_loadu_si256((const __m256i *)(src + ids[n][j] * M + off)), input_shift);
+    dft8x8_q15_256_dir(x[0],x[1],x[2],x[3],x[4],x[5],x[6],x[7],
+                       &s[n][0],&s[n][1],&s[n][2],&s[n][3],&s[n][4],&s[n][5],&s[n][6],&s[n][7],dir);
+  }
+  for (int k = 0; k < 8; k++) {
+    __m256i z0,z1,z2;
+    dft1536_radix3_butterfly8_q15_256_scaled_wide(s[0][k],s[1][k],s[2][k],&z0,&z1,&z2,dir);
+    y[(3*k)%24]=z0; y[(8+3*k)%24]=z1; y[(16+3*k)%24]=z2;
+  }
+}
 
-/* DFT1536 uses M=64. The parent W1536 coefficients include 1/sqrt(24);
- * branch 0 has no phase rotation and therefore uses the explicit Q15
- * 1/sqrt(24) multiply in the stage below. */
+/* DFT1536 uses M=64. The DFT1536-specific radix-3 above already applies
+ * 1/sqrt(3), so these parent W1536 coefficients carry the remaining
+ * 1/sqrt(8). Branch 0 uses the explicit Q15 1/sqrt(8) multiply below. */
 static pthread_mutex_t dft1536_radix24_twiddle_mutex=PTHREAD_MUTEX_INITIALIZER;static int dft1536_radix24_twiddle_ready;static __m256i dft1536_radix24_twiddle_re[2][8][24] __attribute__((aligned(64))),dft1536_radix24_twiddle_im[2][8][24] __attribute__((aligned(64)));
-static void dft1536_radix24_twiddles_init(void){if(__builtin_expect(__atomic_load_n(&dft1536_radix24_twiddle_ready,__ATOMIC_ACQUIRE),1))return;pthread_mutex_lock(&dft1536_radix24_twiddle_mutex);if(__atomic_load_n(&dft1536_radix24_twiddle_ready,__ATOMIC_RELAXED)){pthread_mutex_unlock(&dft1536_radix24_twiddle_mutex);return;}const float sc=1.0f/sqrtf((float)24);for(int ds=0;ds<2;ds++){const dft_dir_t dir=ds==0?DFT_DIR_FORWARD:DFT_DIR_INVERSE;for(int bl=0;bl<8;bl++){int off=8*bl;for(int br=0;br<24;br++){dft1536_radix24_twiddle_re[ds][bl][br]=pack8_twiddle_q15_re_re_scaled(off,br,1536,sc);dft1536_radix24_twiddle_im[ds][bl][br]=pack8_twiddle_q15_im_signed_scaled(off,br,1536,sc,dir);}}}__atomic_store_n(&dft1536_radix24_twiddle_ready,1,__ATOMIC_RELEASE);pthread_mutex_unlock(&dft1536_radix24_twiddle_mutex);}
+static void dft1536_radix24_twiddles_init(void){if(__builtin_expect(__atomic_load_n(&dft1536_radix24_twiddle_ready,__ATOMIC_ACQUIRE),1))return;pthread_mutex_lock(&dft1536_radix24_twiddle_mutex);if(__atomic_load_n(&dft1536_radix24_twiddle_ready,__ATOMIC_RELAXED)){pthread_mutex_unlock(&dft1536_radix24_twiddle_mutex);return;}const float sc=1.0f/sqrtf((float)8);for(int ds=0;ds<2;ds++){const dft_dir_t dir=ds==0?DFT_DIR_FORWARD:DFT_DIR_INVERSE;for(int bl=0;bl<8;bl++){int off=8*bl;for(int br=0;br<24;br++){dft1536_radix24_twiddle_re[ds][bl][br]=pack8_twiddle_q15_re_re_scaled(off,br,1536,sc);dft1536_radix24_twiddle_im[ds][bl][br]=pack8_twiddle_q15_im_signed_scaled(off,br,1536,sc,dir);}}}__atomic_store_n(&dft1536_radix24_twiddle_ready,1,__ATOMIC_RELEASE);pthread_mutex_unlock(&dft1536_radix24_twiddle_mutex);}
+
+/* --------------------------------------------------------------------------
+ * DFT1536 headroom diagnostics.
+ *
+ * Enable with:
+ *   OAI_DFT1536_HEADROOM_DEBUG=1
+ *
+ * This instrumentation is intentionally confined to the DFT1536 R24xDFT64
+ * path. It does not change scaling or arithmetic: the debug helpers execute
+ * the same saturating AVX2 operations while counting lanes whose exact
+ * add/sub result lies outside int16_t range. A compact report is printed once
+ * for each ~128-count input-amplitude bucket, which makes the standard DFT
+ * amplitude sweep easy to read without flooding the log.
+ * -------------------------------------------------------------------------- */
+typedef struct {
+  uint64_t parent_dft8_sat;
+  uint64_t parent_r3_sat;
+  uint64_t parent_twiddle_sat;
+  uint64_t leaf_dft8_first_sat;
+  uint64_t leaf_twiddle_sat;
+  uint64_t leaf_dft8_second_sat;
+  uint64_t leaf_dc_sat;
+  uint32_t input_max;
+  uint32_t parent_dft8_max;
+  uint32_t parent_r3_max;
+  uint32_t parent_scaled_max;
+  uint32_t leaf_dft8_first_max;
+  uint32_t leaf_twiddle_max;
+  uint32_t leaf_dft8_second_max;
+  uint32_t leaf_dc_max;
+  uint32_t output_max;
+  double input_avg_mag;
+  int input_shift;
+} dft1536_headroom_debug_t;
+
+static pthread_once_t g_dft1536_headroom_debug_once = PTHREAD_ONCE_INIT;
+static int g_dft1536_headroom_debug_enabled;
+static __thread int g_dft1536_headroom_last_bucket = -1;
+
+static void dft1536_headroom_debug_init_once(void)
+{
+  const char *e = getenv("OAI_DFT1536_HEADROOM_DEBUG");
+  g_dft1536_headroom_debug_enabled = e && e[0] == '1' && e[1] == '\0';
+}
+
+static inline int dft1536_headroom_debug_is_enabled(void)
+{
+  pthread_once(&g_dft1536_headroom_debug_once, dft1536_headroom_debug_init_once);
+  return g_dft1536_headroom_debug_enabled;
+}
+
+static inline uint32_t dft1536_debug_abs_i16(int16_t x)
+{
+  return x == INT16_MIN ? 32768u : (uint32_t)(x < 0 ? -x : x);
+}
+
+static inline void dft1536_debug_update_vec_max(__m256i v, uint32_t *maxv)
+{
+  int16_t a[16] __attribute__((aligned(32)));
+  _mm256_store_si256((__m256i *)a, v);
+  for (int i = 0; i < 16; i++) {
+    const uint32_t av = dft1536_debug_abs_i16(a[i]);
+    if (av > *maxv)
+      *maxv = av;
+  }
+}
+
+static inline uint64_t dft1536_debug_count_add_sat(__m256i a, __m256i b)
+{
+  int16_t av[16] __attribute__((aligned(32)));
+  int16_t bv[16] __attribute__((aligned(32)));
+  _mm256_store_si256((__m256i *)av, a);
+  _mm256_store_si256((__m256i *)bv, b);
+  uint64_t n = 0;
+  for (int i = 0; i < 16; i++) {
+    const int32_t s = (int32_t)av[i] + (int32_t)bv[i];
+    n += (s > INT16_MAX || s < INT16_MIN);
+  }
+  return n;
+}
+
+static inline uint64_t dft1536_debug_count_sub_sat(__m256i a, __m256i b)
+{
+  int16_t av[16] __attribute__((aligned(32)));
+  int16_t bv[16] __attribute__((aligned(32)));
+  _mm256_store_si256((__m256i *)av, a);
+  _mm256_store_si256((__m256i *)bv, b);
+  uint64_t n = 0;
+  for (int i = 0; i < 16; i++) {
+    const int32_t s = (int32_t)av[i] - (int32_t)bv[i];
+    n += (s > INT16_MAX || s < INT16_MIN);
+  }
+  return n;
+}
+
+static inline __m256i dft1536_debug_adds_epi16(__m256i a, __m256i b, uint64_t *sat)
+{
+  *sat += dft1536_debug_count_add_sat(a, b);
+  return _mm256_adds_epi16(a, b);
+}
+
+static inline __m256i dft1536_debug_subs_epi16(__m256i a, __m256i b, uint64_t *sat)
+{
+  *sat += dft1536_debug_count_sub_sat(a, b);
+  return _mm256_subs_epi16(a, b);
+}
+
+static inline __m256i dft1536_debug_complex_mul8_prepack_q15_256(__m256i a,
+                                                                  __m256i w_re_re,
+                                                                  __m256i w_im_signed,
+                                                                  uint64_t *sat)
+{
+  const __m256i a_swapped = swap_complex_pairs_i16_256(a);
+  const __m256i prod_re = _mm256_mulhrs_epi16(a, w_re_re);
+  const __m256i prod_im = _mm256_mulhrs_epi16(a_swapped, w_im_signed);
+  return dft1536_debug_adds_epi16(prod_re, prod_im, sat);
+}
+
+static inline void dft1536_debug_dft8x8_q15_256_dir(const __m256i x0,
+                                                      const __m256i x1,
+                                                      const __m256i x2,
+                                                      const __m256i x3,
+                                                      const __m256i x4,
+                                                      const __m256i x5,
+                                                      const __m256i x6,
+                                                      const __m256i x7,
+                                                      __m256i *Y0,
+                                                      __m256i *Y1,
+                                                      __m256i *Y2,
+                                                      __m256i *Y3,
+                                                      __m256i *Y4,
+                                                      __m256i *Y5,
+                                                      __m256i *Y6,
+                                                      __m256i *Y7,
+                                                      dft_dir_t dir,
+                                                      uint64_t *sat,
+                                                      uint32_t *max_out)
+{
+  const __m256i c = _mm256_set1_epi16(Q15_INV_SQRT2);
+
+  const __m256i s04 = dft1536_debug_adds_epi16(x0, x4, sat);
+  const __m256i d04 = dft1536_debug_subs_epi16(x0, x4, sat);
+  const __m256i s15 = dft1536_debug_adds_epi16(x1, x5, sat);
+  const __m256i d15 = dft1536_debug_subs_epi16(x1, x5, sat);
+  const __m256i s26 = dft1536_debug_adds_epi16(x2, x6, sat);
+  const __m256i d26 = dft1536_debug_subs_epi16(x2, x6, sat);
+  const __m256i s37 = dft1536_debug_adds_epi16(x3, x7, sat);
+  const __m256i d37 = dft1536_debug_subs_epi16(x3, x7, sat);
+
+  const __m256i s02 = dft1536_debug_adds_epi16(s04, s26, sat);
+  const __m256i d02 = dft1536_debug_subs_epi16(s04, s26, sat);
+  const __m256i s13 = dft1536_debug_adds_epi16(s15, s37, sat);
+  const __m256i d13 = dft1536_debug_subs_epi16(s15, s37, sat);
+
+  *Y0 = dft1536_debug_adds_epi16(s02, s13, sat);
+  *Y4 = dft1536_debug_subs_epi16(s02, s13, sat);
+  *Y2 = dft1536_debug_adds_epi16(d02, mul_minus_j_dir_i16_256(d13, dir), sat);
+  *Y6 = dft1536_debug_adds_epi16(d02, mul_plus_j_dir_i16_256(d13, dir), sat);
+
+  const __m256i p = dft1536_debug_adds_epi16(d15, d37, sat);
+  const __m256i q = dft1536_debug_subs_epi16(d15, d37, sat);
+  const __m256i d26_mj = mul_minus_j_dir_i16_256(d26, dir);
+  const __m256i d26_pj = mul_plus_j_dir_i16_256(d26, dir);
+  const __m256i base_mj = dft1536_debug_adds_epi16(d04, d26_mj, sat);
+  const __m256i base_pj = dft1536_debug_adds_epi16(d04, d26_pj, sat);
+  const __m256i t1_arg = dft1536_debug_adds_epi16(q, mul_minus_j_dir_i16_256(p, dir), sat);
+  const __m256i t3_arg = dft1536_debug_adds_epi16(q, mul_plus_j_dir_i16_256(p, dir), sat);
+  const __m256i t1 = _mm256_mulhrs_epi16(c, t1_arg);
+  const __m256i t3 = _mm256_mulhrs_epi16(c, t3_arg);
+
+  *Y1 = dft1536_debug_adds_epi16(base_mj, t1, sat);
+  *Y5 = dft1536_debug_subs_epi16(base_mj, t1, sat);
+  *Y7 = dft1536_debug_adds_epi16(base_pj, t3, sat);
+  *Y3 = dft1536_debug_subs_epi16(base_pj, t3, sat);
+
+  dft1536_debug_update_vec_max(*Y0, max_out);
+  dft1536_debug_update_vec_max(*Y1, max_out);
+  dft1536_debug_update_vec_max(*Y2, max_out);
+  dft1536_debug_update_vec_max(*Y3, max_out);
+  dft1536_debug_update_vec_max(*Y4, max_out);
+  dft1536_debug_update_vec_max(*Y5, max_out);
+  dft1536_debug_update_vec_max(*Y6, max_out);
+  dft1536_debug_update_vec_max(*Y7, max_out);
+}
+
+static inline void dft1536_debug_radix3_butterfly8_q15_256(__m256i x0,
+                                                            __m256i x1,
+                                                            __m256i x2,
+                                                            __m256i *y0,
+                                                            __m256i *y1,
+                                                            __m256i *y2,
+                                                            dft_dir_t dir,
+                                                            uint64_t *sat,
+                                                            uint32_t *max_out)
+{
+  const __m256i sum = dft1536_debug_adds_epi16(x1, x2, sat);
+  const __m256i diff = dft1536_debug_subs_epi16(x1, x2, sat);
+  const __m256i base = dft1536_debug_subs_epi16(x0,
+                                                 _mm256_mulhrs_epi16(sum, _mm256_set1_epi16(Q15_HALF)),
+                                                 sat);
+  const __m256i imag = _mm256_mulhrs_epi16(diff, _mm256_set1_epi16(Q15_HALF_SQRT3));
+
+  *y0 = dft1536_debug_adds_epi16(x0, sum, sat);
+  *y1 = dft1536_debug_adds_epi16(base, mul_minus_j_dir_i16_256(imag, dir), sat);
+  *y2 = dft1536_debug_adds_epi16(base, mul_plus_j_dir_i16_256(imag, dir), sat);
+
+  dft1536_debug_update_vec_max(*y0, max_out);
+  dft1536_debug_update_vec_max(*y1, max_out);
+  dft1536_debug_update_vec_max(*y2, max_out);
+}
+
+static inline void dft1536_debug_input_stats(const c16_t *src, dft1536_headroom_debug_t *d)
+{
+  double sum_mag = 0.0;
+  for (int n = 0; n < 1536; n++) {
+    const int32_t re = src[n].r;
+    const int32_t im = src[n].i;
+    const uint32_t ar = re == INT16_MIN ? 32768u : (uint32_t)(re < 0 ? -re : re);
+    const uint32_t ai = im == INT16_MIN ? 32768u : (uint32_t)(im < 0 ? -im : im);
+    if (ar > d->input_max)
+      d->input_max = ar;
+    if (ai > d->input_max)
+      d->input_max = ai;
+    sum_mag += sqrt((double)re * (double)re + (double)im * (double)im);
+  }
+  d->input_avg_mag = sum_mag / 1536.0;
+}
+
+static inline void dft1536_debug_print_once_per_amplitude(const dft1536_headroom_debug_t *d)
+{
+  const int bucket = ((int)(d->input_avg_mag + 64.0) / 128) * 128;
+  if (bucket == g_dft1536_headroom_last_bucket)
+    return;
+  g_dft1536_headroom_last_bucket = bucket;
+
+  fprintf(stderr,
+          "[DFT1536 HEADROOM] avg_mag=%.1f input_max=%u input_shift=%+d\n"
+          "  parent DFT8 raw : sat=%llu max=%u\n"
+          "  parent R3 raw   : sat=%llu max=%u\n"
+          "  parent scaled   : cmul_sat=%llu max=%u\n"
+          "  leaf DFT8 #1    : sat=%llu max=%u\n"
+          "  leaf twiddle    : cmul_sat=%llu max=%u\n"
+          "  leaf DFT8 #2    : sat=%llu max=%u\n"
+          "  leaf DC         : sat=%llu max=%u\n"
+          "  final output    : max=%u\n",
+          d->input_avg_mag,
+          d->input_max,
+          d->input_shift,
+          (unsigned long long)d->parent_dft8_sat,
+          d->parent_dft8_max,
+          (unsigned long long)d->parent_r3_sat,
+          d->parent_r3_max,
+          (unsigned long long)d->parent_twiddle_sat,
+          d->parent_scaled_max,
+          (unsigned long long)d->leaf_dft8_first_sat,
+          d->leaf_dft8_first_max,
+          (unsigned long long)d->leaf_twiddle_sat,
+          d->leaf_twiddle_max,
+          (unsigned long long)d->leaf_dft8_second_sat,
+          d->leaf_dft8_second_max,
+          (unsigned long long)d->leaf_dc_sat,
+          d->leaf_dc_max,
+          d->output_max);
+}
+
+static inline void radix24_pfa_raw8_q15_256_shifted_debug(const c16_t *src,
+                                                          int M,
+                                                          int off,
+                                                          __m256i y[24],
+                                                          dft_dir_t dir,
+                                                          int input_shift,
+                                                          dft1536_headroom_debug_t *dbg)
+{
+  static const int ids[3][8] = {{0,9,18,3,12,21,6,15},{16,1,10,19,4,13,22,7},{8,17,2,11,20,5,14,23}};
+  __m256i s[3][8];
+  for (int n = 0; n < 3; n++) {
+    __m256i x[8];
+    for (int j = 0; j < 8; j++)
+      x[j] = x86_dft_shift_q15_256(_mm256_loadu_si256((const __m256i *)(src + ids[n][j] * M + off)), input_shift);
+    dft1536_debug_dft8x8_q15_256_dir(x[0], x[1], x[2], x[3], x[4], x[5], x[6], x[7],
+                                      &s[n][0], &s[n][1], &s[n][2], &s[n][3],
+                                      &s[n][4], &s[n][5], &s[n][6], &s[n][7],
+                                      dir, &dbg->parent_dft8_sat, &dbg->parent_dft8_max);
+  }
+  for (int k = 0; k < 8; k++) {
+    __m256i z0, z1, z2;
+    dft1536_debug_radix3_butterfly8_q15_256(s[0][k], s[1][k], s[2][k],
+                                             &z0, &z1, &z2, dir,
+                                             &dbg->parent_r3_sat, &dbg->parent_r3_max);
+    y[(3 * k) % 24] = z0;
+    y[(8 + 3 * k) % 24] = z1;
+    y[(16 + 3 * k) % 24] = z2;
+  }
+}
+
+static inline void dft1536_radix24_stage_shifted_debug(const c16_t *src,
+                                                        c16_t *b,
+                                                        dft_dir_t dir,
+                                                        int input_shift,
+                                                        dft1536_headroom_debug_t *dbg)
+{
+  enum { M = 64 };
+  const int ds = dir == DFT_DIR_FORWARD ? 0 : 1;
+  dft1536_radix24_twiddles_init();
+  for (int off = 0; off < M; off += 8) {
+    __m256i z[24];
+    radix24_pfa_raw8_q15_256_shifted_debug(src, M, off, z, dir, input_shift, dbg);
+    for (int br = 0; br < 24; br++) {
+      __m256i v;
+      if (br == 0) {
+        v = _mm256_mulhrs_epi16(z[br], _mm256_set1_epi16(Q15_INV_SQRT24));
+      } else {
+        v = dft1536_debug_complex_mul8_prepack_q15_256(z[br],
+                                                        dft1536_radix24_twiddle_re[ds][off >> 3][br],
+                                                        dft1536_radix24_twiddle_im[ds][off >> 3][br],
+                                                        &dbg->parent_twiddle_sat);
+      }
+      dft1536_debug_update_vec_max(v, &dbg->parent_scaled_max);
+      _mm256_store_si256((__m256i *)(b + br * M + off), v);
+    }
+  }
+}
+
+static inline __m256i dft1536_debug_dft64x8_dc_q15_256(const __m256i x[64],
+                                                        dft1536_headroom_debug_t *dbg)
+{
+  __m256i sum_lo = _mm256_setzero_si256();
+  __m256i sum_hi = _mm256_setzero_si256();
+
+  for (int q = 0; q < 8; q++) {
+    const __m256i s04 = dft1536_debug_adds_epi16(x[q + 0], x[q + 32], &dbg->leaf_dc_sat);
+    const __m256i s15 = dft1536_debug_adds_epi16(x[q + 8], x[q + 40], &dbg->leaf_dc_sat);
+    const __m256i s26 = dft1536_debug_adds_epi16(x[q + 16], x[q + 48], &dbg->leaf_dc_sat);
+    const __m256i s37 = dft1536_debug_adds_epi16(x[q + 24], x[q + 56], &dbg->leaf_dc_sat);
+    const __m256i s02 = dft1536_debug_adds_epi16(s04, s26, &dbg->leaf_dc_sat);
+    const __m256i s13 = dft1536_debug_adds_epi16(s15, s37, &dbg->leaf_dc_sat);
+    const __m256i h0 = dft1536_debug_adds_epi16(s02, s13, &dbg->leaf_dc_sat);
+
+    sum_lo = _mm256_add_epi32(sum_lo, _mm256_cvtepi16_epi32(_mm256_castsi256_si128(h0)));
+    sum_hi = _mm256_add_epi32(sum_hi, _mm256_cvtepi16_epi32(_mm256_extracti128_si256(h0, 1)));
+  }
+
+  const __m256i round = _mm256_set1_epi32(4);
+  sum_lo = _mm256_srai_epi32(_mm256_add_epi32(sum_lo, _mm256_add_epi32(round, _mm256_srai_epi32(sum_lo, 31))), 3);
+  sum_hi = _mm256_srai_epi32(_mm256_add_epi32(sum_hi, _mm256_add_epi32(round, _mm256_srai_epi32(sum_hi, 31))), 3);
+
+  const __m128i lo = _mm_packs_epi32(_mm256_castsi256_si128(sum_lo), _mm256_extracti128_si256(sum_lo, 1));
+  const __m128i hi = _mm_packs_epi32(_mm256_castsi256_si128(sum_hi), _mm256_extracti128_si256(sum_hi, 1));
+  const __m256i out = _mm256_inserti128_si256(_mm256_castsi128_si256(lo), hi, 1);
+  dft1536_debug_update_vec_max(out, &dbg->leaf_dc_max);
+  return out;
+}
+
+static inline void dft1536_radix24_dft64x8_store_debug(const c16_t *b,
+                                                        int M,
+                                                        c16_t *dst,
+                                                        int R,
+                                                        int first,
+                                                        dft_dir_t dir,
+                                                        dft1536_headroom_debug_t *dbg)
+{
+  __m256i leaf[64] __attribute__((aligned(64)));
+  selected_q15_twiddles_init();
+
+  for (int n = 0; n < 64; n += 8) {
+    __m256i z[8];
+    for (int br = 0; br < 8; br++)
+      z[br] = _mm256_loadu_si256((const __m256i *)(b + (first + br) * M + n));
+    transpose8_complex_i16_256(&z[0], &z[1], &z[2], &z[3], &z[4], &z[5], &z[6], &z[7]);
+    for (int l = 0; l < 8; l++)
+      leaf[n + l] = z[l];
+  }
+
+  const __m256i dc = dft1536_debug_dft64x8_dc_q15_256(leaf, dbg);
+  const int ds = dir == DFT_DIR_FORWARD ? 0 : 1;
+  __m256i t[8][8] __attribute__((aligned(64)));
+
+  {
+    __m256i h[8];
+    dft1536_debug_dft8x8_q15_256_dir(leaf[0], leaf[8], leaf[16], leaf[24], leaf[32], leaf[40], leaf[48], leaf[56],
+                                      &h[0], &h[1], &h[2], &h[3], &h[4], &h[5], &h[6], &h[7],
+                                      dir, &dbg->leaf_dft8_first_sat, &dbg->leaf_dft8_first_max);
+    t[0][0] = _mm256_srai_epi16(h[0], 3);
+    dft1536_debug_update_vec_max(t[0][0], &dbg->leaf_twiddle_max);
+    for (int r = 1; r < 8; r++) {
+      t[r][0] = _mm256_mulhrs_epi16(h[r], selected_dft64_re[ds][r][0]);
+      dft1536_debug_update_vec_max(t[r][0], &dbg->leaf_twiddle_max);
+    }
+  }
+
+  for (int q = 1; q < 8; q++) {
+    __m256i h[8];
+    dft1536_debug_dft8x8_q15_256_dir(leaf[q], leaf[q + 8], leaf[q + 16], leaf[q + 24],
+                                      leaf[q + 32], leaf[q + 40], leaf[q + 48], leaf[q + 56],
+                                      &h[0], &h[1], &h[2], &h[3], &h[4], &h[5], &h[6], &h[7],
+                                      dir, &dbg->leaf_dft8_first_sat, &dbg->leaf_dft8_first_max);
+    t[0][q] = _mm256_srai_epi16(h[0], 3);
+    dft1536_debug_update_vec_max(t[0][q], &dbg->leaf_twiddle_max);
+    for (int r = 1; r < 8; r++) {
+      t[r][q] = dft1536_debug_complex_mul8_prepack_q15_256(h[r],
+                                                            selected_dft64_re[ds][r][q],
+                                                            selected_dft64_im[ds][r][q],
+                                                            &dbg->leaf_twiddle_sat);
+      dft1536_debug_update_vec_max(t[r][q], &dbg->leaf_twiddle_max);
+    }
+  }
+
+  for (int r = 0; r < 8; r++) {
+    __m256i y[8];
+    dft1536_debug_dft8x8_q15_256_dir(t[r][0], t[r][1], t[r][2], t[r][3], t[r][4], t[r][5], t[r][6], t[r][7],
+                                      &y[0], &y[1], &y[2], &y[3], &y[4], &y[5], &y[6], &y[7],
+                                      dir, &dbg->leaf_dft8_second_sat, &dbg->leaf_dft8_second_max);
+    for (int q = 0; q < 8; q++) {
+      const int k = 8 * q + r;
+      dft1536_debug_update_vec_max(y[q], &dbg->output_max);
+      _mm256_storeu_si256((__m256i *)(dst + R * k + first), y[q]);
+    }
+  }
+
+  dft1536_debug_update_vec_max(dc, &dbg->output_max);
+  _mm256_storeu_si256((__m256i *)(dst + first), dc);
+}
+
 /* Store the radix-24 parent in branch-major order: b[branch * M + k].
  * This layout lets groups of eight DFT64 leaves be transposed into AVX2 lanes
  * without a whole-transform output buffer. */
-static inline void dft1536_radix24_stage(const c16_t*src,c16_t*b,dft_dir_t dir){enum{M=64};const int ds=dir==DFT_DIR_FORWARD?0:1;dft1536_radix24_twiddles_init();for(int off=0;off<M;off+=8){__m256i z[24];radix24_pfa_raw8_q15_256(src,M,off,z,dir);for(int br=0;br<24;br++){__m256i v=br==0?_mm256_mulhrs_epi16(z[br],_mm256_set1_epi16(Q15_INV_SQRT24)):complex_mul8_prepack_q15_256(z[br],dft1536_radix24_twiddle_re[ds][off>>3][br],dft1536_radix24_twiddle_im[ds][off>>3][br]);_mm256_store_si256((__m256i*)(b+br*M+off),v);}}}
+static inline void dft1536_radix24_stage_shifted(const c16_t*src,c16_t*b,dft_dir_t dir,int input_shift){enum{M=64};const int ds=dir==DFT_DIR_FORWARD?0:1;dft1536_radix24_twiddles_init();for(int off=0;off<M;off+=8){__m256i z[24];radix24_pfa_raw8_q15_256_shifted(src,M,off,z,dir,input_shift);for(int br=0;br<24;br++){__m256i v=br==0?_mm256_mulhrs_epi16(z[br],_mm256_set1_epi16(Q15_INV_SQRT8)):complex_mul8_prepack_q15_256(z[br],dft1536_radix24_twiddle_re[ds][off>>3][br],dft1536_radix24_twiddle_im[ds][off>>3][br]);_mm256_store_si256((__m256i*)(b+br*M+off),v);}}}
 /* DFT1536 = radix-24 parent followed by 24 DFT64 leaves. The leaves are
  * processed as three groups of eight and written directly to the final
  * radix-24-interleaved output. */
-static void dft1536_radix24_pfa_leaf64(const c16_t*src,c16_t*dst,dft_dir_t dir){enum{M=64};c16_t b[24*M] __attribute__((aligned(64)));dft1536_radix24_stage(src,b,dir);dft1536_radix24_dft64x8_store(b,M,dst,24,0,dir);dft1536_radix24_dft64x8_store(b,M,dst,24,8,dir);dft1536_radix24_dft64x8_store(b,M,dst,24,16,dir);}
+static void dft1536_radix24_pfa_leaf64_shifted(const c16_t *src, c16_t *dst, dft_dir_t dir, int input_shift)
+{
+  enum { M = 64 };
+  c16_t b[24 * M] __attribute__((aligned(64)));
+
+  /* The previous headroom debug path reproduces the old saturating radix-3
+   * and would therefore invalidate this experiment. Keep it disabled here. */
+  (void)dft1536_headroom_debug_is_enabled();
+
+  dft1536_radix24_stage_shifted(src, b, dir, input_shift);
+  dft1536_radix24_dft64x8_store(b, M, dst, 24, 0, dir);
+  dft1536_radix24_dft64x8_store(b, M, dst, 24, 8, dir);
+  dft1536_radix24_dft64x8_store(b, M, dst, 24, 16, dir);
+}
+static void dft1536_radix24_pfa_leaf64(const c16_t*src,c16_t*dst,dft_dir_t dir){dft1536_radix24_pfa_leaf64_shifted(src,dst,dir,0);}
 
 /* DFT1728: R27 x DFT64. */
 /* Convert eight branch-major DFT64 leaves into the lane-parallel layout used
@@ -6552,9 +7891,10 @@ static inline void radix30_stage_1920(const c16_t *src,c16_t *b,dft_dir_t dir){e
 }}
 static void dft1920_radix30_pfa_avx2_selected(const c16_t *src,c16_t *dst,dft_dir_t dir){enum{R=30,M=64};c16_t b[R*M] __attribute__((aligned(64)));radix30_stage_1920(src,b,dir);dft64x8_parent_store_from_branches(b,M,dst,R,0,dir);dft64x8_parent_store_from_branches(b,M,dst,R,8,dir);dft64x8_parent_store_from_branches(b,M,dst,R,16,dir);c16_t tail[64] __attribute__((aligned(64)));for(int br=24;br<30;br++){dft64_avx(b+br*M,tail,dir);for(int k=0;k<M;k++)dst[R*k+br]=tail[k];}}
 
-static inline void radix30_pfa_stage_to_branch_major_q15_256_960(const c16_t *src,
+static inline void radix30_pfa_stage_to_branch_major_q15_256_960_shifted(const c16_t *src,
                                                                    c16_t *b,
-                                                                   dft_dir_t dir)
+                                                                   dft_dir_t dir,
+                                                                   int input_shift)
 {
   enum { N = 960, R = 30, M = 32 };
   const int ds = dir == DFT_DIR_FORWARD ? 0 : 1;
@@ -6565,12 +7905,12 @@ static inline void radix30_pfa_stage_to_branch_major_q15_256_960(const c16_t *sr
 
 #define R30_PFA_DFT6(C, I0, I1, I2, I3, I4, I5)                                                \
     do {                                                                                          \
-      dft6_pfa8_q15_256(_mm256_loadu_si256((const __m256i *)(src + (I0) * M + off)),             \
-                           _mm256_loadu_si256((const __m256i *)(src + (I1) * M + off)),             \
-                           _mm256_loadu_si256((const __m256i *)(src + (I2) * M + off)),             \
-                           _mm256_loadu_si256((const __m256i *)(src + (I3) * M + off)),             \
-                           _mm256_loadu_si256((const __m256i *)(src + (I4) * M + off)),             \
-                           _mm256_loadu_si256((const __m256i *)(src + (I5) * M + off)),             \
+      dft6_pfa8_q15_256(x86_dft_shift_q15_256(_mm256_loadu_si256((const __m256i *)(src + (I0) * M + off)), input_shift),             \
+                           x86_dft_shift_q15_256(_mm256_loadu_si256((const __m256i *)(src + (I1) * M + off)), input_shift),             \
+                           x86_dft_shift_q15_256(_mm256_loadu_si256((const __m256i *)(src + (I2) * M + off)), input_shift),             \
+                           x86_dft_shift_q15_256(_mm256_loadu_si256((const __m256i *)(src + (I3) * M + off)), input_shift),             \
+                           x86_dft_shift_q15_256(_mm256_loadu_si256((const __m256i *)(src + (I4) * M + off)), input_shift),             \
+                           x86_dft_shift_q15_256(_mm256_loadu_si256((const __m256i *)(src + (I5) * M + off)), input_shift),             \
                            s[(C)], dir);                                                             \
     } while (0)
 
@@ -6618,18 +7958,25 @@ static inline void radix30_pfa_stage_to_branch_major_q15_256_960(const c16_t *sr
   }
 }
 
-static void dft960_radix30_pfa_avx2_selected(const c16_t *src, c16_t *dst, dft_dir_t dir)
+
+static void dft960_radix30_pfa_avx2_selected_shifted(const c16_t *src, c16_t *dst, dft_dir_t dir, int input_shift)
 {
   enum { R = 30, M = 32 };
   c16_t b[R * M] __attribute__((aligned(64)));
 
-  radix30_pfa_stage_to_branch_major_q15_256_960(src, b, dir);
+  radix30_pfa_stage_to_branch_major_q15_256_960_shifted(src, b, dir, input_shift);
 
   dft32x8_twiddle_scaled_store(b,M,dst,R,0,8,dir);
   dft32x8_twiddle_scaled_store(b,M,dst,R,8,8,dir);
   dft32x8_twiddle_scaled_store(b,M,dst,R,16,8,dir);
   dft32x8_twiddle_scaled_store(b,M,dst,R,24,6,dir);
 }
+
+static void dft960_radix30_pfa_avx2_selected(const c16_t *src, c16_t *dst, dft_dir_t dir)
+{
+  dft960_radix30_pfa_avx2_selected_shifted(src, dst, dir, 0);
+}
+
 
 /* DFT2160 = true R30 PFA parent x 30 DFT72 leaves.  Four groups of eight
  * leaves are evaluated lane-wise and written directly to the final R30
@@ -6835,7 +8182,7 @@ static void dispatch_selected_radix15_radix30(const c16_t *src, c16_t *dst, int 
     radix15_scatter4_q15_128(y, dst, M, k);
 }
 
-static void radix3_pow2_selected(const c16_t *src, c16_t *dst, int N, dft_dir_t dir)
+static void radix3_pow2_selected_shifted(const c16_t *src, c16_t *dst, int N, dft_dir_t dir, int input_shift)
 {
   const int size = N / 3;
   const size_t need = 2u * (size_t)N + dft_power2_mixed_large_work_len(size);
@@ -6846,7 +8193,7 @@ static void radix3_pow2_selected(const c16_t *src, c16_t *dst, int N, dft_dir_t 
   c16_t *sub = work;
   c16_t *tmp = work + N;
   c16_t *child_work = work + 2 * N;
-  pack_radix3_selected(src, sub, size);
+  pack_radix3_selected_shifted(src, sub, size, input_shift);
   dft_power2_selected_child(sub, tmp, size, dir, child_work);
   dft_power2_selected_child(sub + size, tmp + size, size, dir, child_work);
   dft_power2_selected_child(sub + 2 * size, tmp + 2 * size, size, dir, child_work);
@@ -6871,6 +8218,12 @@ static void radix3_pow2_selected(const c16_t *src, c16_t *dst, int N, dft_dir_t 
   }
 
 }
+
+static void radix3_pow2_selected(const c16_t *src, c16_t *dst, int N, dft_dir_t dir)
+{
+  radix3_pow2_selected_shifted(src, dst, N, dir, 0);
+}
+
 
 static void radix_3_fft_c16_scaled_strided(const c16_t *src, int stride, c16_t *dst, int N, dft_dir_t dir)
 {
@@ -7551,8 +8904,9 @@ static void dft720_radix30_leaf24_twscaled_avx2_selected(const c16_t *src, c16_t
  * 6144  = R24 x DFT256x8
  * 12288 = R24 x DFT512x8
  *
- * The complete R24 normalization is carried by the final parent W_N
- * coefficients (1/sqrt(24)); each child transform carries its own
+ * The shared wide radix-3 contributes 1/sqrt(3). The final parent W_N
+ * coefficients carry the remaining 1/sqrt(8), giving the complete
+ * 1/sqrt(24) R24 normalization. Each child transform carries its own
  * normalization. No whole-N final scatter buffer is used. */
 
 /* DFT3072 keeps only the six final DFT64x8 inputs. The R24 results at child
@@ -7573,15 +8927,17 @@ static __attribute__((noinline, cold)) void dft3072_r24_init_slow(void)
     return;
   }
 
-  const float s24 = 1.0f / sqrtf(24.0f);
+  /* The shared R24 radix-3 wide stage already applies 1/sqrt(3).
+   * Carry only the remaining 1/sqrt(8) in the parent W_N coefficients. */
+  const float s8 = 1.0f / sqrtf(8.0f);
   for (int bl = 0; bl < 16; bl++) {
     const int off = 8 * bl;
     for (int br = 1; br < 24; br++) {
-      dft3072_r24_re[bl][br - 1] = pack8_twiddle_q15_re_re_scaled(off, br, 3072, s24);
+      dft3072_r24_re[bl][br - 1] = pack8_twiddle_q15_re_re_scaled(off, br, 3072, s8);
       dft3072_r24_im[0][bl][br - 1] =
-          pack8_twiddle_q15_im_signed_scaled(off, br, 3072, s24, DFT_DIR_FORWARD);
+          pack8_twiddle_q15_im_signed_scaled(off, br, 3072, s8, DFT_DIR_FORWARD);
       dft3072_r24_im[1][bl][br - 1] =
-          pack8_twiddle_q15_im_signed_scaled(off, br, 3072, s24, DFT_DIR_INVERSE);
+          pack8_twiddle_q15_im_signed_scaled(off, br, 3072, s8, DFT_DIR_INVERSE);
     }
   }
 
@@ -7611,12 +8967,12 @@ static __attribute__((always_inline)) inline void dft3072_r24_init(void)
   dft3072_r24_init_slow();
 }
 
-static inline void dft3072_r24_r2_to_batches(const c16_t *src,
+static inline void dft3072_r24_r2_to_batches_shifted(const c16_t *src,
                                               __m256i work[3][2][64],
-                                              dft_dir_t dir)
+                                              dft_dir_t dir, int input_shift)
 {
   const int ds = dir == DFT_DIR_FORWARD ? 0 : 1;
-  const __m256i s24 = _mm256_set1_epi16(Q15_INV_SQRT24);
+  const __m256i s8 = _mm256_set1_epi16(Q15_INV_SQRT8);
   const __m256i s2 = _mm256_set1_epi16(Q15_INV_SQRT2);
   dft3072_r24_init();
 
@@ -7625,8 +8981,8 @@ static inline void dft3072_r24_r2_to_batches(const c16_t *src,
     const __m256i r2_re = _mm256_load_si256((const __m256i *)(dft3072_r2_re + k0));
     const __m256i r2_im = _mm256_load_si256((const __m256i *)(dft3072_r2_im[ds] + k0));
     __m256i z[2][24];
-    radix24_pfa_raw8_q15_256(src, 128, k0, z[0], dir);
-    radix24_pfa_raw8_q15_256(src, 128, k0 + 64, z[1], dir);
+    radix24_pfa_raw8_q15_256_shifted(src, 128, k0, z[0], dir, input_shift);
+    radix24_pfa_raw8_q15_256_shifted(src, 128, k0 + 64, z[1], dir, input_shift);
 
     for (int group = 0; group < 3; group++) {
       __m256i row[2][8];
@@ -7634,12 +8990,12 @@ static inline void dft3072_r24_r2_to_batches(const c16_t *src,
       for (int lane = 0; lane < 8; lane++) {
         const int br = first + lane;
         const __m256i x0 = br == 0
-                               ? _mm256_mulhrs_epi16(z[0][0], s24)
+                               ? _mm256_mulhrs_epi16(z[0][0], s8)
                                : complex_mul8_prepack_q15_256(
                                      z[0][br], dft3072_r24_re[block][br - 1],
                                      dft3072_r24_im[ds][block][br - 1]);
         const __m256i x1 = br == 0
-                               ? _mm256_mulhrs_epi16(z[1][0], s24)
+                               ? _mm256_mulhrs_epi16(z[1][0], s8)
                                : complex_mul8_prepack_q15_256(
                                      z[1][br], dft3072_r24_re[block + 8][br - 1],
                                      dft3072_r24_im[ds][block + 8][br - 1]);
@@ -7659,6 +9015,7 @@ static inline void dft3072_r24_r2_to_batches(const c16_t *src,
   }
 }
 
+
 static inline void dft3072_dft64x8_pair_store(__m256i x[2][64],
                                                c16_t *dst,
                                                int first,
@@ -7672,33 +9029,20 @@ static inline void dft3072_dft64x8_pair_store(__m256i x[2][64],
   _mm256_storeu_si256((__m256i *)(dst + 24 + first), odd_dc);
 }
 
-static void dft3072_r24_dft128x8_direct(const c16_t *src, c16_t *dst, dft_dir_t dir)
+static void dft3072_r24_dft128x8_direct_shifted(const c16_t *src, c16_t *dst, dft_dir_t dir, int input_shift)
 {
   __m256i work[3][2][64] __attribute__((aligned(64)));
   selected_q15_twiddles_init();
-  dft3072_r24_r2_to_batches(src, work, dir);
+  dft3072_r24_r2_to_batches_shifted(src, work, dir, input_shift);
   for (int group = 0; group < 3; group++)
     dft3072_dft64x8_pair_store(work[group], dst, 8 * group, dir);
 }
 
-static __attribute__((always_inline)) inline void
-r24_store8_child_outputs(const c16_t *const p[8], int M, c16_t *dst, int first)
+static void dft3072_r24_dft128x8_direct(const c16_t *src, c16_t *dst, dft_dir_t dir)
 {
-  for (int k = 0; k < M; k += 8) {
-    __m256i z0 = _mm256_loadu_si256((const __m256i *)(p[0] + k));
-    __m256i z1 = _mm256_loadu_si256((const __m256i *)(p[1] + k));
-    __m256i z2 = _mm256_loadu_si256((const __m256i *)(p[2] + k));
-    __m256i z3 = _mm256_loadu_si256((const __m256i *)(p[3] + k));
-    __m256i z4 = _mm256_loadu_si256((const __m256i *)(p[4] + k));
-    __m256i z5 = _mm256_loadu_si256((const __m256i *)(p[5] + k));
-    __m256i z6 = _mm256_loadu_si256((const __m256i *)(p[6] + k));
-    __m256i z7 = _mm256_loadu_si256((const __m256i *)(p[7] + k));
-    transpose8_complex_i16_256(&z0, &z1, &z2, &z3, &z4, &z5, &z6, &z7);
-    const __m256i z[8] = {z0,z1,z2,z3,z4,z5,z6,z7};
-    for (int lane = 0; lane < 8; lane++)
-      _mm256_storeu_si256((__m256i *)(dst + 24 * (k + lane) + first), z[lane]);
-  }
+  dft3072_r24_dft128x8_direct_shifted(src, dst, dir, 0);
 }
+
 
 #define DEFINE_R24_PARENT_TABLES(TAG,NVAL,BLOCKS) \
 static pthread_mutex_t TAG##_mtx = PTHREAD_MUTEX_INITIALIZER; \
@@ -7709,7 +9053,8 @@ static void TAG##_init(void) { \
   if (__builtin_expect(__atomic_load_n(&TAG##_ready, __ATOMIC_ACQUIRE), 1)) return; \
   pthread_mutex_lock(&TAG##_mtx); \
   if (__atomic_load_n(&TAG##_ready, __ATOMIC_RELAXED)) { pthread_mutex_unlock(&TAG##_mtx); return; } \
-  const float sc = 1.0f / sqrtf(24.0f); \
+  /* R3 wide contributes 1/sqrt(3); parent twiddles carry 1/sqrt(8). */ \
+  const float sc = 1.0f / sqrtf(8.0f); \
   for (int ds = 0; ds < 2; ds++) { \
     const dft_dir_t d = ds == 0 ? DFT_DIR_FORWARD : DFT_DIR_INVERSE; \
     for (int bl = 0; bl < BLOCKS; bl++) { \
@@ -7724,16 +9069,16 @@ static void TAG##_init(void) { \
   pthread_mutex_unlock(&TAG##_mtx); \
 }
 
-#define DEFINE_R24_PARENT_STAGE(TAG,MVAL) \
-static void TAG##_stage(const c16_t *src, c16_t *b, dft_dir_t dir) { \
+#define DEFINE_R24_PARENT_STAGE_SHIFTED(TAG,MVAL) \
+static void TAG##_stage_shifted(const c16_t *src, c16_t *b, dft_dir_t dir, int input_shift) { \
   const int ds = dir == DFT_DIR_FORWARD ? 0 : 1; \
   TAG##_init(); \
   for (int off = 0; off < MVAL; off += 8) { \
     __m256i z[24]; \
-    radix24_pfa_raw8_q15_256(src, MVAL, off, z, dir); \
+    radix24_pfa_raw8_q15_256_shifted(src, MVAL, off, z, dir, input_shift); \
     for (int br = 0; br < 24; br++) { \
       const __m256i v = br == 0 \
-        ? _mm256_mulhrs_epi16(z[br], _mm256_set1_epi16(Q15_INV_SQRT24)) \
+        ? _mm256_mulhrs_epi16(z[br], _mm256_set1_epi16(Q15_INV_SQRT8)) \
         : complex_mul8_prepack_q15_256(z[br], TAG##_re[ds][off >> 3][br], TAG##_im[ds][off >> 3][br]); \
       _mm256_store_si256((__m256i *)(b + br * (MVAL) + off), v); \
     } \
@@ -7742,7 +9087,7 @@ static void TAG##_stage(const c16_t *src, c16_t *b, dft_dir_t dir) { \
 
 DEFINE_R24_PARENT_TABLES(r24_6144_parent, 6144, 32)
 DEFINE_R24_PARENT_TABLES(r24_12288_parent, 12288, 64)
-DEFINE_R24_PARENT_STAGE(r24_12288_parent, 512)
+DEFINE_R24_PARENT_STAGE_SHIFTED(r24_12288_parent, 512)
 
 /* DFT6144-specific true DFT256x8 child.  A vector lane is one R24
  * branch, so the R16 parent and DFT16 leaves below advance eight
@@ -7786,17 +9131,17 @@ static __attribute__((always_inline)) inline void dft6144_leaf256_init(void)
   dft6144_leaf256_init_slow();
 }
 
-static inline void dft6144_r24_parent_to_batches(const c16_t *src,
+static inline void dft6144_r24_parent_to_batches_shifted(const c16_t *src,
                                                   __m256i work[3][16][16],
-                                                  dft_dir_t dir)
+                                                  dft_dir_t dir, int input_shift)
 {
   const int ds = dir == DFT_DIR_FORWARD ? 0 : 1;
-  const __m256i s24 = _mm256_set1_epi16(Q15_INV_SQRT24);
+  const __m256i s8 = _mm256_set1_epi16(Q15_INV_SQRT8);
   r24_6144_parent_init();
 
   for (int off = 0; off < 256; off += 8) {
     __m256i z[24];
-    radix24_pfa_raw8_q15_256(src, 256, off, z, dir);
+    radix24_pfa_raw8_q15_256_shifted(src, 256, off, z, dir, input_shift);
 
     for (int group = 0; group < 3; group++) {
       const int first = 8 * group;
@@ -7804,7 +9149,7 @@ static inline void dft6144_r24_parent_to_batches(const c16_t *src,
       for (int lane = 0; lane < 8; lane++) {
         const int br = first + lane;
         row[lane] = br == 0
-                        ? _mm256_mulhrs_epi16(z[0], s24)
+                        ? _mm256_mulhrs_epi16(z[0], s8)
                         : complex_mul8_prepack_q15_256(z[br],
                                                        r24_6144_parent_re[ds][off >> 3][br],
                                                        r24_6144_parent_im[ds][off >> 3][br]);
@@ -7818,6 +9163,7 @@ static inline void dft6144_r24_parent_to_batches(const c16_t *src,
     }
   }
 }
+
 
 static inline void dft6144_dft256x8_store(__m256i stage[16][16],
                                            c16_t *dst,
@@ -7854,15 +9200,21 @@ static inline void dft6144_dft256x8_store(__m256i stage[16][16],
   }
 }
 
-static void dft6144_r24_leaf256_direct(const c16_t *src, c16_t *dst, dft_dir_t dir)
+static void dft6144_r24_leaf256_direct_shifted(const c16_t *src, c16_t *dst, dft_dir_t dir, int input_shift)
 {
   __m256i work[3][16][16] __attribute__((aligned(64)));
   selected_q15_twiddles_init();
   dft6144_leaf256_init();
-  dft6144_r24_parent_to_batches(src, work, dir);
+  dft6144_r24_parent_to_batches_shifted(src, work, dir, input_shift);
   for (int group = 0; group < 3; group++)
     dft6144_dft256x8_store(work[group], dst, 8 * group, dir);
 }
+
+static void dft6144_r24_leaf256_direct(const c16_t *src, c16_t *dst, dft_dir_t dir)
+{
+  dft6144_r24_leaf256_direct_shifted(src, dst, dir, 0);
+}
+
 
 /* A vector lane holds one of eight independent R24 children throughout the
  * R8 parent and its DFT64 leaves. Keeping that layout between the stages
@@ -7954,16 +9306,22 @@ static void dft12288_leaf512x8_store(const c16_t *b,
     dft64x8_selected_store(leaf[r], dst, R * 8, first + R * r, dir);
 }
 
-static void dft12288_r24_leaf512_direct(const c16_t *src, c16_t *dst, dft_dir_t dir)
+static void dft12288_r24_leaf512_direct_shifted(const c16_t *src, c16_t *dst, dft_dir_t dir, int input_shift)
 {
   enum { R = 24, M = 512, N = R * M };
   c16_t b[N] __attribute__((aligned(64)));
-  r24_12288_parent_stage(src, b, dir);
+  r24_12288_parent_stage_shifted(src, b, dir, input_shift);
   for (int first = 0; first < R; first += 8)
     dft12288_leaf512x8_store(b, dst, first, dir);
 }
 
-#undef DEFINE_R24_PARENT_STAGE
+static void dft12288_r24_leaf512_direct(const c16_t *src, c16_t *dst, dft_dir_t dir)
+{
+  dft12288_r24_leaf512_direct_shifted(src, dst, dir, 0);
+}
+
+
+#undef DEFINE_R24_PARENT_STAGE_SHIFTED
 #undef DEFINE_R24_PARENT_TABLES
 
 static void dft_mixed_radix_c16_scaled_strided(const c16_t *src, int stride, c16_t *dst, int N, dft_dir_t dir)
@@ -8203,20 +9561,129 @@ static void dft_mixed_radix_c16_scaled(const c16_t *src, c16_t *dst, int N, dft_
   }
   dft_mixed_radix_c16_scaled_strided(src, 1, dst, N, dir);
 }
-#define DEFINE_MIXED_DFT_ONLY(N)                                                     \
-  void dft##N(int16_t *input, int16_t *output, uint8_t scale_flag)                   \
-  {                                                                                  \
-    (void)scale_flag;                                                                \
-                                                                                     \
-    dft_mixed_radix_c16_scaled((c16_t *)input, (c16_t *)output, N, DFT_DIR_FORWARD); \
+
+static void dft_mixed_radix_c16_adaptive_forward(const c16_t *src, c16_t *dst, int N, uint8_t scale_flag)
+{
+  const int input_shift = x86_dft_adaptive_choose_shift(src, N, scale_flag);
+
+  /* Temporary diagnostic: report the adaptive decision once per DFT size. */
+  static int last_reported_n = -1;
+  if (__builtin_expect(N != last_reported_n, 0)) {
+    printf("\033[1;36m[OAI DFT adaptive]\033[0m N=%d shift=%+d %s\033[0m\n",
+           N,
+           input_shift,
+           input_shift ? "\033[1;32mAPPLIED" : "\033[1;33mNOT_APPLIED");
+    fflush(stdout);
+    last_reported_n = N;
+  }
+  if (!input_shift) {
+    dft_mixed_radix_c16_scaled(src, dst, N, DFT_DIR_FORWARD);
+    return;
   }
 
-#define DEFINE_MIXED_IDFT_ONLY(N)                                                    \
-  void idft##N(int16_t *input, int16_t *output, uint8_t scale_flag)                  \
-  {                                                                                  \
-    (void)scale_flag;                                                                \
-                                                                                     \
-    dft_mixed_radix_c16_scaled((c16_t *)input, (c16_t *)output, N, DFT_DIR_INVERSE); \
+  /* Specialized paths apply the adaptive gain in the first AVX2 stage and
+   * avoid an intermediate scaled-input copy. */
+  switch (N) {
+    case 576:
+      dispatch_selected_radix9_radix18_shifted(src, dst, N, DFT_DIR_FORWARD, input_shift);
+      return;
+    case 648:
+      radix81_terminal_leaf8_direct_shifted(src, dst, DFT_DIR_FORWARD, input_shift);
+      return;
+    case 960:
+      dft960_radix30_pfa_avx2_selected_shifted(src, dst, DFT_DIR_FORWARD, input_shift);
+      return;
+    case 1152:
+      dft1152_radix18_leaf64_avx2_selected_shifted(src, dst, DFT_DIR_FORWARD, input_shift);
+      return;
+    case 1296:
+      radix81_terminal_leaf16_direct_w16folded_shifted(src, dst, DFT_DIR_FORWARD, input_shift);
+      return;
+    case 2304:
+      dispatch_selected_radix9_radix18_shifted(src, dst, N, DFT_DIR_FORWARD, input_shift);
+      return;
+    case 2592:
+      radix81_terminal_leaf32_direct_2592_shifted(src, dst, DFT_DIR_FORWARD, input_shift);
+      return;
+    case 1536:
+      dft1536_radix24_pfa_leaf64_shifted(src, dst, DFT_DIR_FORWARD, input_shift);
+      return;
+    case 3072:
+      dft3072_r24_dft128x8_direct_shifted(src, dst, DFT_DIR_FORWARD, input_shift);
+      return;
+    case 6144:
+      dft6144_r24_leaf256_direct_shifted(src, dst, DFT_DIR_FORWARD, input_shift);
+      return;
+    case 12288:
+      dft12288_r24_leaf512_direct_shifted(src, dst, DFT_DIR_FORWARD, input_shift);
+      return;
+    default:
+      break;
+  }
+
+  if (is_power_of_two_int(N) && N >= 1024 && N != 16384) {
+    dft_power2_mixed_large_q15_shifted(src, dst, N, DFT_DIR_FORWARD, input_shift);
+    return;
+  }
+
+  if ((N % 3) == 0 && is_power_of_two_int(N / 3)) {
+    radix3_pow2_selected_shifted(src, dst, N, DFT_DIR_FORWARD, input_shift);
+    return;
+  }
+
+  /* Remaining families still use an AVX2 shift-copy fallback.  No output
+   * compensation pass is performed: the adaptive gain is intentionally kept. */
+  c16_t *scaled = x86_dft_tls_adaptive_work((size_t)N);
+  AssertFatal(scaled != NULL, "x86 DFT: adaptive input allocation failed N=%d\n", N);
+  x86_dft_shift_copy_q15_avx2(src, scaled, N, input_shift);
+  dft_mixed_radix_c16_scaled(scaled, dst, N, DFT_DIR_FORWARD);
+}
+
+
+static inline void dft_mixed_radix_c16_adaptive_inverse_transparent(const c16_t *src,
+                                                                    c16_t *dst,
+                                                                    int N,
+                                                                    uint8_t scale_flag)
+{
+  const int input_shift = x86_idft_adaptive_choose_shift(src, N, scale_flag);
+  if (input_shift == 0) {
+    dft_mixed_radix_c16_scaled(src, dst, N, DFT_DIR_INVERSE);
+    return;
+  }
+
+  c16_t *scaled = x86_dft_tls_adaptive_work((size_t)N);
+  c16_t *raw = x86_idft_tls_output_work((size_t)N);
+  AssertFatal(scaled != NULL && raw != NULL,
+              "x86 IDFT: adaptive scratch allocation failed N=%d\n",
+              N);
+
+  x86_dft_shift_copy_q15_avx2(src, scaled, N, input_shift);
+  dft_mixed_radix_c16_scaled(scaled, raw, N, DFT_DIR_INVERSE);
+  x86_idft_restore_positive_gain_q15_avx2(raw, dst, N, input_shift);
+}
+
+#define DEFINE_MIXED_DFT_ONLY(N)                                                               \
+  void dft##N(int16_t *input, int16_t *output, uint8_t scale_flag)                              \
+  {                                                                                             \
+    dft_mixed_radix_c16_adaptive_forward((const c16_t *)input, (c16_t *)output, N, scale_flag); \
+  }
+
+/* The chooser returns immediately for N < 512, so small transforms never scan
+ * their input or allocate adaptive scratch.  Only 4/8 use this direct macro. */
+#define DEFINE_MIXED_DFT_ONLY_PLAIN(N)                                                \
+  void dft##N(int16_t *input, int16_t *output, uint8_t scale_flag)                    \
+  {                                                                                   \
+    (void)scale_flag;                                                                  \
+    dft_mixed_radix_c16_scaled((const c16_t *)input, (c16_t *)output, N, DFT_DIR_FORWARD); \
+  }
+
+#define DEFINE_MIXED_IDFT_ONLY(N)                                                                 \
+  void idft##N(int16_t *input, int16_t *output, uint8_t scale_flag)                               \
+  {                                                                                               \
+    dft_mixed_radix_c16_adaptive_inverse_transparent((const c16_t *)input,                        \
+                                                       (c16_t *)output,                            \
+                                                       N,                                          \
+                                                       scale_flag);                                \
   }
 
 DEFINE_MIXED_IDFT_ONLY(4)
@@ -8236,8 +9703,8 @@ DEFINE_MIXED_IDFT_ONLY(20)
 DEFINE_MIXED_IDFT_ONLY(24)
 DEFINE_MIXED_IDFT_ONLY(32)
 
-DEFINE_MIXED_DFT_ONLY(4)
-DEFINE_MIXED_DFT_ONLY(8)
+DEFINE_MIXED_DFT_ONLY_PLAIN(4)
+DEFINE_MIXED_DFT_ONLY_PLAIN(8)
 
 DEFINE_MIXED_DFT_ONLY(192)
 DEFINE_MIXED_DFT_ONLY(384)
@@ -8346,8 +9813,7 @@ DEFINE_MIXED_IDFT_ONLY(240)
 
 void dft288(int16_t *input, int16_t *output, uint8_t scale_flag)
 {
-  (void)scale_flag;
-  radix9_terminal_leaf32_direct((const c16_t *)input, (c16_t *)output, DFT_DIR_FORWARD);
+  dft_mixed_radix_c16_adaptive_forward((const c16_t *)input, (c16_t *)output, 288, scale_flag);
 }
 
 void idft288(int16_t *input, int16_t *output, uint8_t scale_flag)

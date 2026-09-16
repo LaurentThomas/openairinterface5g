@@ -561,7 +561,9 @@ int main(int argc, char **argv) {
       {"sinus_freq", "if chirp is false, sinut frequency in KHz", .uptr = &c.sinus_freq, .defintval = 10000, TYPE_UINT, 0},
       {"dft", "dft size for signal frequency/time convertion", .uptr = &c.dft, .defintval = 8192, TYPE_UINT, 0},
       {"file", "input I/Q samples in ascii, sequence I then Q\n", PARAMFLAG_MALLOCINCONFIG, .strptr = &c.file, .defstrval = NULL, TYPE_STRING, 0},
-      {"dump_iq", "dump the tx iq file at begining",  PARAMFLAG_MALLOCINCONFIG, .strptr = &c.dump_iq, .defstrval = NULL, TYPE_STRING, 0},
+      {"dump_iq", "dump the tx iq file at begining\n",  PARAMFLAG_MALLOCINCONFIG, .strptr = &c.dump_iq, .defstrval = NULL, TYPE_STRING, 0},
+      {"tx_subdev", "tx xdma file (default /dev/xdma0_h2c_0)\n",  PARAMFLAG_MALLOCINCONFIG, .strptr = &c.tx_subdev, .defstrval = "/dev/xdma0_h2c_0", TYPE_STRING, 0},
+      {"rx_subdev", "rx xdma file (default /dev/xdma0_c2h_0)\n",  PARAMFLAG_MALLOCINCONFIG, .strptr = &c.rx_subdev, .defstrval = "/dev/xdma0_h2c_0", TYPE_STRING, 0},
   };
   config_process_cmdline(uniqCfg, cmdline_params, sizeofArray(cmdline_params), NULL);
   CONFIG_CLEARRTFLAG(CONFIG_NOEXITONHELP);
@@ -582,6 +584,8 @@ int main(int argc, char **argv) {
   openair0_config_t openair0_cfg = {
       .duplex_mode = duplex_mode_TDD,
       .sample_rate = sampling_rate,
+      .tx_subdev=c.tx_subdev? c.tx_subdev:"/dev/xdma0_h2c_0",
+      .rx_subdev=c.rx_subdev? c.rx_subdev:"/dev/xdma0_c2h_0",
       .num_rb_dl=-1, // flag to say we are rftest, don't scale IQ samples for OAI
       .tx_sample_advance = 0,
       .rx_num_channels = antennas,
