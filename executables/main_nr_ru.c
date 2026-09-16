@@ -230,7 +230,7 @@ int main(int argc, char **argv)
   AssertFatal(ret == 0, "RU %u: trx_start_func() ret %d: cannot start rfdevice\n", ru->idx, ret);
 
   // Signal handler
-  signal(SIGINT, sig_handler);
+  //signal(SIGINT, sig_handler);
 
   ret = oru_fh_start(oru.fronthaul);
   AssertFatal(ret == 0, "Cannot start O-RU fronthaul\n");
