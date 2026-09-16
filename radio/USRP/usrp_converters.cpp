@@ -304,7 +304,7 @@ void register_oai_converters(int rxshift)
 
       uhd::convert::register_converter(
           tx_id,
-          []() { return uhd::convert::converter::sptr(new sc16_oai_tx_converter<4, swap_le, true>()); },
+          []() { return uhd::convert::converter::sptr(new sc16_oai_tx_converter<2, swap_le, true>()); },
           100);
     }
 
@@ -341,7 +341,7 @@ void register_oai_converters(int rxshift)
 
       uhd::convert::register_converter(
           tx_id,
-          []() { return uhd::convert::converter::sptr(new sc16_oai_tx_converter<4, swap_be, false>()); },
+          []() { return uhd::convert::converter::sptr(new sc16_oai_tx_converter<2, swap_be, false>()); },
           100);
     }
 
@@ -378,7 +378,7 @@ void register_oai_converters(int rxshift)
 
       uhd::convert::register_converter(
           tx_id,
-          []() { return uhd::convert::converter::sptr(new sc16_oai_tx_converter<4, false, false>()); },
+          []() { return uhd::convert::converter::sptr(new sc16_oai_tx_converter<2, false, false>()); },
           100);
     }
   }

@@ -13,6 +13,8 @@ typedef struct {
   uint dft;
   char * file;
   char * dump_iq;
+  char* tx_subdev;
+  char* rx_subdev;
 } config_t;
 
 typedef struct {

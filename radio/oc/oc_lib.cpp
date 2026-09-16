@@ -76,9 +76,6 @@ class TSQueue {
   }
 };
 
-#define DEVICE_WRITE_DEFAULT "/dev/xdma0_h2c_0"
-#define DEVICE_READ_DEFAULT "/dev/xdma0_c2h_0"
-
 static const uint64_t magic_tx = 0xA5A50be3A5A5A5A5LL;
 static const uint64_t magic_rx = 0xA5A50be3A5A5A5A5LL;
 static const uint32_t magic_footer1 = 0xce11;
@@ -89,7 +86,7 @@ static const uint32_t magic_footer2 = 0x5A;
 
 #define WRITE_BLOCK_NB_SAMPLES 2048 * 4
 #define NB_BLOCKS_PER_WRITE 1
-static const uint64_t tx_ahead_max = 32 * 2048;
+static const uint64_t tx_ahead_max = 8 * 2048;
 
 typedef struct {
   uint64_t control;
@@ -436,7 +433,7 @@ static inline int write_block(tx_thr_t *tx, c16_t *samples, uint sz, bool no_sca
     memcpy(ant0->b, samples, sz * sizeof(c16_t));
   else 
     for (uint i = 0; i < sz; i++)
-      ant0->b[i] = (c16_t){(int16_t)(samples[i].r<<4), (int16_t)(samples[i].i<<4)};
+      ant0->b[i] = (c16_t){(int16_t)(samples[i].r), (int16_t)(samples[i].i)};
   tx->tx_ts += sz;
   tx->tx_block_pos += sizeof(headerTx_t) + sz * sizeof(*ant0->b);
   tx->tx_block_num++;
@@ -886,8 +883,8 @@ extern "C" {
     if (device->priv == NULL) {
       st = (oc_state_t *)calloc(1, sizeof(oc_state_t));
       device->priv = st;
-      strcpy(st->filename_write, DEVICE_WRITE_DEFAULT);
-      strcpy(st->filename_read, DEVICE_READ_DEFAULT);
+      strcpy(st->filename_write, openair0_cfg->tx_subdev ?  openair0_cfg->tx_subdev : "/dev/xdma0_h2c_0"  );
+      strcpy(st->filename_read,openair0_cfg->rx_subdev ? openair0_cfg->rx_subdev :  "/dev/xdma0_c2h_0");
       AssertFatal(st != NULL, "OC device: memory allocation failure\n");
       st->tx.continuous_tx = openair0_cfg->duplex_mode == duplex_mode_FDD;
     } else {
