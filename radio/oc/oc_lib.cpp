@@ -744,12 +744,16 @@ static int oc_set_freq(openair0_device_t *device, openair0_config_t *openair0_cf
         openair0_cfg[0].tx_freq[0],
         openair0_cfg[0].rx_freq[0],
         openair0_cfg[0].tune_offset);
-  char txt[1024]={};
-  snprintf(txt, sizeof(txt)-1,  "%s --xcvr --txfreq %lu --rxfreq %lu\n", getenv("MONITOR"), (uint64_t)openair0_cfg[0].tx_freq[0],
-	   (uint64_t)openair0_cfg[0].rx_freq[0]);
-  int ret=system(txt);
-  if (ret!=0)
-    LOG_E(HW, "Mykonos call failed %d\n", ret);
+  static bool notdone=true;
+  if (notdone) {
+    char txt[1024]={};
+    snprintf(txt, sizeof(txt)-1,  "%s --xcvr --txfreq %.0f --rxfreq %.0f\n", getenv("MONITOR"), openair0_cfg[0].tx_freq[0], openair0_cfg[0].rx_freq[0]);
+    int ret=system(txt);
+    if (ret!=0)
+      LOG_E(HW, "Mykonos call failed %d\n", ret);
+    else
+      notdone=false;
+  }
   return 0;
 }
 
