@@ -178,7 +178,7 @@ typedef struct {
   openair0_timestamp_t tx_ts;
   uint txSeq;
   tx_packet_t *tx_block;
-  uint8_t *tx_block_pos;
+  int tx_block_pos;
   uint tx_block_num;
   TSQueue<tx_packet_t *> *ready_tx;
 } tx_thr_t;
@@ -285,7 +285,7 @@ void *write_thread(void *arg)
         const int chip = atoi(getenv("VERIFY_ENCODING"));
         int nb_bits = sizeof(cur->h.timestamp) * 8;
         float sign[nb_bits] = {};
-        c16_t *tx = cur->b;
+        c16_t *tx = (c16_t *)__builtin_assume_aligned(cur->b, 4);
         if (cur->h.packetSz != 8192)
           abort();
         for (int i = 0; i < cur->h.packetSz / chip; i++) {
@@ -372,32 +372,6 @@ struct energy_s compute_papr_db(const c16_t *x, size_t N)
   return (struct energy_s){p_avg, 10.0f * log10f(papr), sqrt(p_max)};
 }
 
-static int32_t signalEnergy(c16_t *input, uint32_t length)
-{
-  // init
-  simde__m128 mm0 = simde_mm_setzero_ps();
-
-  // Acc
-  for (uint32_t i = 0; i < (length >> 2); i++) {
-    simde__m128i in = simde_mm_loadu_si128((simde__m128i *)input);
-    mm0 = simde_mm_add_ps(mm0, simde_mm_cvtepi32_ps(simde_mm_madd_epi16(in, in)));
-    input += 4;
-  }
-
-  // leftover
-  float leftover_sum = 0;
-  c16_t *leftover_input = input + (length & ~3);
-  uint16_t lefover_count = length & 3;
-  for (int32_t i = 0; i < lefover_count; i++) {
-    leftover_sum += leftover_input[i].r * leftover_input[i].r + leftover_input[i].i * leftover_input[i].i;
-  }
-
-  // Ave
-  float sums[4];
-  simde_mm_store_ps(sums, mm0);
-  return (uint32_t)((sums[0] + sums[1] + sums[2] + sums[3] + leftover_sum) / (float)length);
-}
-
 #define BURST_NUM_OF_PACKETS (1u)
 // DC-filter: 0 will be done in FPGA after seeing 128-consecutive samples having the same value
 static inline int write_block(tx_thr_t *tx, c16_t *samples, uint sz, bool no_scaling)
@@ -414,34 +388,39 @@ static inline int write_block(tx_thr_t *tx, c16_t *samples, uint sz, bool no_sca
 
   if (!tx->tx_block) {
     tx->tx_block = (tx_packet_t *)malloc16(NB_BLOCKS_PER_WRITE * sizeof(tx_packet_t));
-    tx->tx_block_pos = (uint8_t *)tx->tx_block;
+    tx->tx_block_num = 0;
+    tx->tx_block_pos = 0;
   }
-  // LOG_I(HW, "add tx packet for %u samples, ts %lu\n", sz,tx->tx_ts);
-  tx_packet_t *ant0 = (tx_packet_t *)tx->tx_block_pos;
-  ant0->h = (headerTx_t){.control = magic_tx,
-                         .packetSeqNum = tx->txSeq++,
-                         .packetSz = sz,
-                         .seqId = stream_seqId,
-                         .filler = 0x02,
-                         .markers = 0xb1,
-                         .filler2 = 0xabcd,
-                         .txGain = 0x112233,
-                         .filler3 = 0xf0,
-                         .ppsOffset = 0x28272625,
-                         .timestamp = (uint64_t)tx->tx_ts};
+  tx_packet_t *ant0 = ((tx_packet_t *)tx->tx_block) + tx->tx_block_num;
+  if (tx->tx_block_pos == 0) {
+    ant0->h = (headerTx_t){.control = magic_tx,
+                           .packetSeqNum = tx->txSeq++,
+                           .packetSz = WRITE_BLOCK_NB_SAMPLES,
+                           .seqId = stream_seqId,
+                           .filler = 0x02,
+                           .markers = 0xb1,
+                           .filler2 = 0xabcd,
+                           .txGain = 0x112233,
+                           .filler3 = 0xf0,
+                           .ppsOffset = 0x28272625,
+                           .timestamp = (uint64_t)tx->tx_ts};
+  }
   if (no_scaling)
-    memcpy(ant0->b, samples, sz * sizeof(c16_t));
+    memcpy(ant0->b + tx->tx_block_pos, samples, sz * sizeof(c16_t));
   else 
     for (uint i = 0; i < sz; i++)
-      ant0->b[i] = (c16_t){(int16_t)(samples[i].r), (int16_t)(samples[i].i)};
+      ant0->b[tx->tx_block_pos + i] = (c16_t){(int16_t)(samples[i].r << 2), (int16_t)(samples[i].i << 2)};
   tx->tx_ts += sz;
-  tx->tx_block_pos += sizeof(headerTx_t) + sz * sizeof(*ant0->b);
-  tx->tx_block_num++;
-  tx->tx_count++;
+  tx->tx_block_pos += sz;
+  if (tx->tx_block_pos > WRITE_BLOCK_NB_SAMPLES)
+    abort();
+  if (tx->tx_block_pos == WRITE_BLOCK_NB_SAMPLES) {
+    tx->tx_block_num++;
+    tx->tx_count++;
+    tx->tx_block_pos = 0;
+  }
   if (tx->tx_block_num == NB_BLOCKS_PER_WRITE) {
     tx->ready_tx->push(tx->tx_block);
-    tx->tx_block_num = 0;
-    tx->tx_block_pos = NULL;
     tx->tx_block = NULL;
   }
   return sz;
@@ -459,21 +438,23 @@ static int oc_write(openair0_device_t *device, openair0_timestamp_t timestamp, v
     tx->first_tx = false;
   }
   if (!getenv("DIRECT")) {
-  int64_t gap = timestamp - tx->tx_ts;
-  if (gap < 0) {
-    LOG_E(HW, "out of sequence\n");
-    gap = 0;
+    int64_t gap = timestamp - tx->tx_ts;
+    if (gap < 0) {
+      LOG_E(HW, "out of sequence\n");
+      gap = 0;
+    }
+
+    if (gap) {
+      LOG_I(HW, "gap of %ld\n", gap);
+      tx->tx_ts = timestamp;
+    } else
+      LOG_D(HW, ".\n");
   }
 
-  if (gap)
-    LOG_I(HW, "gap of %ld\n", gap);
-  else
-    LOG_D(HW, ".\n");
-  }
   int wr_sz = nsamps;
   // LOG_E(HW, "ask to write %d\n", wr_sz);
   while (wr_sz > 0) {
-    int tmp = std::min(wr_sz, WRITE_BLOCK_NB_SAMPLES);
+    int tmp = std::min(wr_sz, WRITE_BLOCK_NB_SAMPLES - tx->tx_block_pos);
     int sz = write_block(tx, ((c16_t *)buff[0]) + nsamps - wr_sz, tmp, device->openair0_cfg->num_rb_dl == -1);
     if (sz != tmp)
       LOG_E(HW, "ask to write %d, res is %d\n", tmp, sz);
