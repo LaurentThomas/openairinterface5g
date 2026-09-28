@@ -387,7 +387,7 @@ static inline int write_block(tx_thr_t *tx, c16_t *samples, uint sz, bool no_sca
   }
 
   if (!tx->tx_block) {
-    tx->tx_block = (tx_packet_t *)malloc16(NB_BLOCKS_PER_WRITE * sizeof(tx_packet_t));
+    posix_memalign((void**)&tx->tx_block, 64, NB_BLOCKS_PER_WRITE * sizeof(tx_packet_t));
     tx->tx_block_num = 0;
     tx->tx_block_pos = 0;
   }
@@ -520,7 +520,7 @@ static bool get_blocks(oc_state_t *s, rx_packet_t *p)
   int readSz = sizeof(*rx->rx_live) * rx->nb_blocks_per_read;
   ssize_t ret = read(rx->fd_read, p, readSz);
   if (ret != readSz || p[0].h.control != magic_rx) {
-    LOG_E(HW, "Error reading header asked for %d bytes, got %ld, magic: %lx\n", readSz, ret, p[0].h.control);
+    LOG_E(HW, "Error reading header asked for %d bytes, got %ld, magic: %lx, errno %d (%s)\n", readSz, ret, p[0].h.control, errno, strerror(errno));
     dumpHD("lost good header:", p[0].h);
     rx->rx_count = -1;
     return false;
@@ -649,7 +649,8 @@ void *read_thread(void *arg)
       while (rx->read_queue->m_queue.size())
         free(rx->read_queue->pop());
     }
-    rx_packet_t *tmp = (rx_packet_t *)malloc(sizeof(*rx->rx_live) * rx->nb_blocks_per_read);
+    rx_packet_t *tmp=NULL;
+    posix_memalign((void**)&tmp, 64, sizeof(*rx->rx_live) * rx->nb_blocks_per_read);
     if (!get_blocks(s, tmp)) {
       printf("getblocks returned bad\n");
       free(tmp);
