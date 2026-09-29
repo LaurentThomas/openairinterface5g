@@ -146,7 +146,7 @@ static inline void dumpHD(std::string ctx, headerRx_t h)
 {
   printf("header dump, %s\n", ctx.c_str());
   uint8_t *z = (uint8_t *)&h;
-  for (uint i = 0; i < sizeof(headerRx_t); i++)
+  for (uint i = 0; i < sizeof(headerRx_t)/4; i++)
     printf("  %02x:%02x %02x:%02x\n", z[i * 4 + 0], z[i * 4 + 1], z[i * 4 + 2], z[i * 4 + 3]);
   printf(
       "decoded magic: %lx\n"
@@ -374,7 +374,7 @@ struct energy_s compute_papr_db(const c16_t *x, size_t N)
 
 #define BURST_NUM_OF_PACKETS (1u)
 // DC-filter: 0 will be done in FPGA after seeing 128-consecutive samples having the same value
-static inline int write_block(tx_thr_t *tx, c16_t *samples, uint sz, bool no_scaling)
+static inline int write_block(tx_thr_t *tx, c16_t **samples, int nb_ant, uint sz, bool no_scaling)
 {
   // TO BE REWRITTEN BY LAURENT THOMAS
   static uint stream_seqId = 0x01;
@@ -387,13 +387,15 @@ static inline int write_block(tx_thr_t *tx, c16_t *samples, uint sz, bool no_sca
   }
 
   if (!tx->tx_block) {
-    posix_memalign((void**)&tx->tx_block, 64, NB_BLOCKS_PER_WRITE * sizeof(tx_packet_t));
+    int ret=posix_memalign((void**)&tx->tx_block, 64, NB_BLOCKS_PER_WRITE * sizeof(tx_packet_t));
+    if (ret)
+      LOG_E(HW,"memalign %d\n",ret);
     tx->tx_block_num = 0;
     tx->tx_block_pos = 0;
   }
-  tx_packet_t *ant0 = ((tx_packet_t *)tx->tx_block) + tx->tx_block_num;
+  tx_packet_t *cur = ((tx_packet_t *)tx->tx_block) + tx->tx_block_num;
   if (tx->tx_block_pos == 0) {
-    ant0->h = (headerTx_t){.control = magic_tx,
+    cur->h = (headerTx_t){.control = magic_tx,
                            .packetSeqNum = tx->txSeq++,
                            .packetSz = WRITE_BLOCK_NB_SAMPLES,
                            .seqId = stream_seqId,
@@ -405,12 +407,16 @@ static inline int write_block(tx_thr_t *tx, c16_t *samples, uint sz, bool no_sca
                            .ppsOffset = 0x28272625,
                            .timestamp = (uint64_t)tx->tx_ts};
   }
-  if (no_scaling)
-    memcpy(ant0->b + tx->tx_block_pos, samples, sz * sizeof(c16_t));
-  else 
-    for (uint i = 0; i < sz; i++)
-      ant0->b[tx->tx_block_pos + i] = (c16_t){(int16_t)(samples[i].r << 2), (int16_t)(samples[i].i << 2)};
-  tx->tx_ts += sz;
+  const uint shift=0; //no_scaling ? 0: 2;
+  c16_t* curvect=cur->b+tx->tx_block_pos;
+  for (uint i = 0; i < sz/nb_ant; i++)
+    for (int j = 0; j < nb_ant; j++) {
+      //LOG_W(HW,"%d %d %d\n", i, j, shift);
+      if (shift) abort();
+      *curvect++ = (c16_t){(int16_t)(samples[j][i].r << shift ), (int16_t)(samples[j][i].i << shift)};
+    }
+
+  tx->tx_ts += sz/nb_ant;
   tx->tx_block_pos += sz;
   if (tx->tx_block_pos > WRITE_BLOCK_NB_SAMPLES)
     abort();
@@ -426,7 +432,7 @@ static inline int write_block(tx_thr_t *tx, c16_t *samples, uint sz, bool no_sca
   return sz;
 }
 
-static int oc_write(openair0_device_t *device, openair0_timestamp_t timestamp, void **buff, int nsamps, int cc, int flags)
+static int oc_write(openair0_device_t *device, openair0_timestamp_t timestamp, void **buff, int nsamps, int nb_ant, int flags)
 {
   oc_state_t *oc = (oc_state_t *)device->priv;
   tx_thr_t *tx = &oc->tx;
@@ -451,11 +457,14 @@ static int oc_write(openair0_device_t *device, openair0_timestamp_t timestamp, v
       LOG_D(HW, ".\n");
   }
 
-  int wr_sz = nsamps;
+  int wr_sz = nsamps*nb_ant;
   // LOG_E(HW, "ask to write %d\n", wr_sz);
   while (wr_sz > 0) {
     int tmp = std::min(wr_sz, WRITE_BLOCK_NB_SAMPLES - tx->tx_block_pos);
-    int sz = write_block(tx, ((c16_t *)buff[0]) + nsamps - wr_sz, tmp, device->openair0_cfg->num_rb_dl == -1);
+    c16_t * tmpvect[nb_ant];
+    for (int i=0; i<nb_ant; i++)
+      tmpvect[i]=((c16_t *)buff[i]) + nsamps - wr_sz/nb_ant;
+    int sz = write_block(tx, tmpvect, nb_ant, tmp, device->openair0_cfg->num_rb_dl == -1);
     if (sz != tmp)
       LOG_E(HW, "ask to write %d, res is %d\n", tmp, sz);
     wr_sz -= sz;
@@ -650,7 +659,8 @@ void *read_thread(void *arg)
         free(rx->read_queue->pop());
     }
     rx_packet_t *tmp=NULL;
-    posix_memalign((void**)&tmp, 64, sizeof(*rx->rx_live) * rx->nb_blocks_per_read);
+    int ret=posix_memalign((void**)&tmp, 64, sizeof(*rx->rx_live) * rx->nb_blocks_per_read);
+    if (ret) abort();
     if (!get_blocks(s, tmp)) {
       printf("getblocks returned bad\n");
       free(tmp);
@@ -660,7 +670,7 @@ void *read_thread(void *arg)
   return NULL;
 }
 
-static int oc_read(openair0_device_t *device, openair0_timestamp_t *ptimestamp, void **buff, int nsamps, int cc)
+static int oc_read(openair0_device_t *device, openair0_timestamp_t *ptimestamp, void **buff, int nsamps, int nb_ant)
 {
   rx_thr_t *rx = &((oc_state_t *)device->priv)->rx;
   static int64_t reads_cnt = 0;
@@ -672,20 +682,24 @@ static int oc_read(openair0_device_t *device, openair0_timestamp_t *ptimestamp, 
   reads_cnt++;
   c16_t **output=(c16_t**)buff;
   int remain_to_get=nsamps;
+  
+  const int nb_samples_per_packet = sizeof(rx->rx_live->b) / sizeof(*rx->rx_live->b);
+  const int nb_samples = nb_samples_per_packet * rx->nb_blocks_per_read;
+  
   while (remain_to_get > 0) {
     while (rx->remain_samples > 0 && remain_to_get > 0) {
       if (rx->gap) {
-        c16_t *out = output[0] + nsamps - remain_to_get;
-        while (rx->gap && remain_to_get) {
-          *out++ = {};
-          remain_to_get--;
-          rx->gap--;
-          rx->rx_ts_interface++;
-        }
+	for (int i=0; i< nb_ant; i++) {
+	  c16_t *out = output[i] + nsamps - remain_to_get;
+	  while (rx->gap && remain_to_get) {
+	    *out++ = {};
+	    remain_to_get--;
+	    rx->gap--;
+	    rx->rx_ts_interface++;
+	  }
+	}
       }
       rx_packet_t *last_rx = rx->rx_live;
-      int nb_samples_per_packet = sizeof(last_rx[0].b) / sizeof(last_rx[0].b[0]);
-      int nb_samples = nb_samples_per_packet * rx->nb_blocks_per_read;
       int consumed_samples = nb_samples - rx->remain_samples;
       int nb_consumed_samples_in_block= consumed_samples%nb_samples_per_packet;
       int bloc = consumed_samples / nb_samples_per_packet;
@@ -702,16 +716,18 @@ static int oc_read(openair0_device_t *device, openair0_timestamp_t *ptimestamp, 
         }
       }
       int remaing_samples_in_block= nb_samples_per_packet-nb_consumed_samples_in_block;
-      int toCopy=std::min(remaing_samples_in_block,remain_to_get );
-      memcpy(output[0] + nsamps - remain_to_get, cur_pkt->b + nb_consumed_samples_in_block, toCopy * sizeof(cur_pkt->b[0]));
-      rx->remain_samples -= toCopy;
+      int toCopy=std::min(remaing_samples_in_block/nb_ant,remain_to_get);
+      for (int i=0; i< nb_ant; i++)
+	for (int j=0; j< toCopy; j++)
+	  output[i][nsamps - remain_to_get + j]=cur_pkt->b[nb_consumed_samples_in_block+j*nb_ant+i];
+      rx->remain_samples -= toCopy*nb_ant;
       remain_to_get -= toCopy;
       rx->rx_ts_interface += toCopy;
     }
     if(  remain_to_get > 0 ) {
       free(rx->rx_live);
       rx->rx_live = rx->read_queue->pop();
-      rx->remain_samples = sizeof(rx->rx_live->b) * rx->nb_blocks_per_read / sizeof(*rx->rx_live->b);
+      rx->remain_samples = nb_samples;
     }
   }
   *ptimestamp = rx->rx_ts_interface - nsamps;

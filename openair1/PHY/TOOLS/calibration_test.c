@@ -165,14 +165,14 @@ void *write_thread(void *arg)
   threads_t *params = (threads_t *)arg;
   c16_t **samplesTx = params->samplesTx;
   uint64_t ts = 0;
-  const float WAVE_AMP = params->c->amplitude;
-  const float sin_freq = params->c->sinus_freq;
+  const float WAVE_AMP = params->c->amplitude[0];
+  const float sin_freq = params->c->sinus_freq[0];
   c16_t * file_input=NULL;
   int num_samples=0;
   if ( params->c->file)
     file_input=read_file(params->c->file, &num_samples);
   else {
-    switch (params->c->tx_pattern) {
+    switch (params->c->tx_pattern[0]) {
     case e_CHIRP: {
       double Fs = 122880.0;
       double f0 = -30 * 1000.0; // start freq
@@ -324,6 +324,13 @@ void *write_thread(void *arg)
   struct timespec last_second;
   clock_gettime(CLOCK_REALTIME, &last_second);
 
+  // hard coded filling tx2
+  if (params->antennas == 2)
+    for (int i = 0; i < params->dft_sz; i++) {
+      samplesTx[1][i].r = WAVE_AMP * cos((i * M_PI * 2 * sin_freq) / 122880000);
+      samplesTx[1][i].i = WAVE_AMP * sin((i * M_PI * 2 * sin_freq) / 122880000); 
+    }
+  
   openair0_timestamp_t last_tx_timestamp = 0;
   // this is tx ahead in main application, the driver has it's tx ahead that should be smaller to prevent starvation
   const int tx_ahead =  params->dft_sz * 20;
@@ -351,7 +358,7 @@ void *write_thread(void *arg)
     }
     do {
       last_tx_timestamp += params->dft_sz;
-      if (params->c->tx_pattern == e_SIGNATURE) {
+      if (params->c->tx_pattern[0] == e_SIGNATURE) {
 	uint64_t signature=last_tx_timestamp+ tx_ahead;
 	int nb_bits=sizeof(signature)*8;
 	memset(samplesTx[0],0,params->dft_sz*sizeof(c16_t));
@@ -431,8 +438,10 @@ void *read_thread(void *arg)
   int nb_aligned = 0;
   while (!oai_exit) {
     uint64_t old = rx_timestamp;
-     __attribute__((aligned(32))) c16_t rx[ params->dft_sz ];
-     c16_t *rxptr=rx;
+     __attribute__((aligned(32))) c16_t rx[params->antennas][ params->dft_sz];
+     c16_t *rxptr[params->antennas];
+     for (int i=0; i<params->antennas; i++)
+       rxptr[i]=rx[i];
     int ret =
         params->rfdevice->trx_read_func(params->rfdevice, &rx_timestamp, (void **)&rxptr, params->dft_sz, params->antennas);
     if (old + params->dft_sz != rx_timestamp)
@@ -441,19 +450,22 @@ void *read_thread(void *arg)
       printf("read of :%d\n", ret);
     count++;
     AssertFatal(!pthread_mutex_lock(&params->rxMutex), "");
-    memcpy(samplesRx[0],rx, sizeof(rx));
-    // LOG_E(HW,"signal: %lu\n", tx_timestamp);
-    /*
-    for (int i = 0; i < params->dft_sz; i++)
-      params->samplesRx[0][i] = (c16_t){params->samplesRx[0][i].r >>2, params->samplesRx[0][i].i >>2};
-    */
+    for (int i=0; i<params->antennas; i++)
+      memcpy(samplesRx[i], rx[i], sizeof(rx[0]));
+    AssertFatal(!pthread_mutex_lock(&params->txMutex), "");
+    tx_timestamp = rx_timestamp;
+    warmup++;
+    if (warmup > 1024)
+      AssertFatal(!pthread_cond_signal(&tx_trig), "");
+    AssertFatal(!pthread_mutex_unlock(&params->txMutex), "");
+    AssertFatal(!pthread_mutex_unlock(&params->rxMutex), "");
     double min=UINT64_MAX, tot_pow=0, tot_samples=0;
     int min_pos=0;
     if (getenv("HOLE")) {
       for (int i = 0; i < params->dft_sz-hole_size; i++) {
 	double local=0;
 	for (int j=i; j<i+hole_size; j++) {
-	  local+=params->samplesRx[0][j].r*params->samplesRx[0][j].r+params->samplesRx[0][j].i*params->samplesRx[0][j].i;
+	  local+=rx[0][j].r*rx[0][j].r+rx[0][j].i*rx[0][j].i;
 	}
 	tot_samples+=hole_size;
 	tot_pow+=local;
@@ -463,12 +475,16 @@ void *read_thread(void *arg)
 	}
       }
     }
-    if (params->c->tx_pattern == e_SIGNATURE) {
+    if (min < tot_pow/(2*tot_samples)) {
+      LOG_I(HW, "found hole %lu, programmed for %lu, received %ld later\n", min_pos+rx_timestamp, last_hole,min_pos+rx_timestamp - last_hole  );
+      samples_to_insert=min_pos+rx_timestamp - last_hole ;
+    }
+    if (params->c->tx_pattern[0] == e_SIGNATURE) {
       int sz=sizeof(rx_timestamp)*8;
       float sign[sz]={};
       for (int i=0; i<params->dft_sz/chip; i++){
 	int bit=i%sz;
-	c16_t *tmp=rx+i*chip;
+	c16_t *tmp=rx[0]+i*chip;
 	for (int j=0; j<chip; j++)
 	    sign[bit]+=tmp[j].r*tmp[j].r+tmp[j].i*tmp[j].i;
       }
@@ -493,17 +509,6 @@ void *read_thread(void *arg)
       }
       old_sign=encoded_ts;
     }
-    AssertFatal(!pthread_mutex_lock(&params->txMutex), "");
-    tx_timestamp = rx_timestamp;
-    if (min < tot_pow/(2*tot_samples)) {
-      LOG_I(HW, "found hole %lu, programmed for %lu, received %ld later\n", min_pos+rx_timestamp, last_hole,min_pos+rx_timestamp - last_hole  );
-      samples_to_insert=min_pos+rx_timestamp - last_hole ;
-    }
-    warmup++;
-    if (warmup > 1024)
-      AssertFatal(!pthread_cond_signal(&tx_trig), "");
-    AssertFatal(!pthread_mutex_unlock(&params->txMutex), "");
-    AssertFatal(!pthread_mutex_unlock(&params->rxMutex), "");
     //    dft(get_dft(len), (int16_t *)form->timeDomain, (int16_t *)form->freqDomain, 1);
     struct timespec now;
     clock_gettime(CLOCK_REALTIME, &now);
@@ -545,25 +550,20 @@ int main(int argc, char **argv) {
   CONFIG_SETRTFLAG(CONFIG_NOEXITONHELP);
   get_common_options(uniqCfg);
 
-  config_t c = {1, 1, 3750000, 1, 2047, 10000, 8192, NULL};
+  config_t c = {1, 1, 1, 3750000, {1}, {2047}, {10000}, 8192, NULL};
   paramdef_t cmdline_params[] = {
       {"tx", "enable tx", 0, .uptr = &c.tx, .defintval = 1, TYPE_UINT, 0},
       {"rx", "enable tx", 0, .uptr = &c.rx, .defintval = 1, TYPE_UINT, 0},
       {"freq", "center frequency in kHz", 0, .uptr = &c.freq, .defintval = 1, TYPE_UINT, 0},
-      {"tx_pattern",
-       "generate signal for a sine (0), chirp (1), qpsk (2), qam-16 (3), qam-64 (4), qam-256 (5)",
-       0,
-       .uptr = &c.tx_pattern,
-       .defintval = 2,
-       TYPE_UINT,
-       0},
-      {"amplitude", "signal amplitude (int16)", 0, .uptr = &c.amplitude, .defintval = 2047, TYPE_UINT, 0},
-      {"sinus_freq", "if chirp is false, sinut frequency in KHz", .uptr = &c.sinus_freq, .defintval = 10000, TYPE_UINT, 0},
+      {"tx_pattern", "generate signal for a sine (0), chirp (1), qpsk (2), qam-16 (3), qam-64 (4), qam-256 (5)", 0,.uptr = &c.tx_pattern[0],.defintval = 2, TYPE_UINT, 0},
+      {"amplitude", "signal amplitude (int16)", 0, .uptr = &c.amplitude[0], .defintval = 2047, TYPE_UINT, 0},
+      {"sinus_freq", "if chirp is false, sinut frequency in KHz", .uptr = &c.sinus_freq[0], .defintval = 10000, TYPE_UINT, 0},
       {"dft", "dft size for signal frequency/time convertion", .uptr = &c.dft, .defintval = 8192, TYPE_UINT, 0},
       {"file", "input I/Q samples in ascii, sequence I then Q\n", PARAMFLAG_MALLOCINCONFIG, .strptr = &c.file, .defstrval = NULL, TYPE_STRING, 0},
       {"dump_iq", "dump the tx iq file at begining\n",  PARAMFLAG_MALLOCINCONFIG, .strptr = &c.dump_iq, .defstrval = NULL, TYPE_STRING, 0},
       {"tx_subdev", "tx xdma file (default /dev/xdma0_h2c_0)\n",  PARAMFLAG_MALLOCINCONFIG, .strptr = &c.tx_subdev, .defstrval = "/dev/xdma0_h2c_0", TYPE_STRING, 0},
       {"rx_subdev", "rx xdma file (default /dev/xdma0_c2h_0)\n",  PARAMFLAG_MALLOCINCONFIG, .strptr = &c.rx_subdev, .defstrval = "/dev/xdma0_h2c_0", TYPE_STRING, 0},
+      {"nb_ant", "tx and rx antennas", 0, .uptr = &c.nb_ant, .defintval = 1, TYPE_UINT, 0},
   };
   config_process_cmdline(uniqCfg, cmdline_params, sizeofArray(cmdline_params), NULL);
   CONFIG_CLEARRTFLAG(CONFIG_NOEXITONHELP);
@@ -575,7 +575,6 @@ int main(int argc, char **argv) {
 
   int sampling_rate = 30.72e6 * 6; // for X300 test, OC will overload it
 
-  int antennas = 1;
   uint64_t freq = c.freq * 1000;
   int rxGain = 90;
   int txGain = 0;
@@ -588,8 +587,8 @@ int main(int argc, char **argv) {
       .rx_subdev=c.rx_subdev? c.rx_subdev:"/dev/xdma0_c2h_0",
       .num_rb_dl=-1, // flag to say we are rftest, don't scale IQ samples for OAI
       .tx_sample_advance = 0,
-      .rx_num_channels = antennas,
-      .tx_num_channels = antennas,
+      .rx_num_channels = c.nb_ant,
+      .tx_num_channels = c.nb_ant,
       .rx_freq = {freq, freq, freq, freq},
       .tx_freq = {freq, freq, freq, freq},
       .rx_gain_calib_table = NULL,
@@ -620,17 +619,17 @@ int main(int argc, char **argv) {
   printf("generate a sinus wave at middle RB");
   load_dftslib();
 
-  c16_t **samplesRx = malloc16(antennas * sizeof(c16_t *));
-  for (int i = 0; i < antennas; i++) {
+  c16_t **samplesRx = malloc16(c.nb_ant * sizeof(c16_t *));
+  for (int i = 0; i < c.nb_ant; i++) {
     samplesRx[i] = malloc16_clear(c.dft * sizeof(c16_t));
   }
-  c16_t **samplesTx = malloc16(antennas * sizeof(c16_t *));
-  for (int i = 0; i < antennas; i++) {
+  c16_t **samplesTx = malloc16(c.nb_ant * sizeof(c16_t *));
+  for (int i = 0; i < c.nb_ant; i++) {
     samplesTx[i] = malloc16_clear(c.dft * sizeof(c16_t));
   }
 
   /* scopedata shall be filled from a software FIFO and not directly from the samples */
-  threads_t params = (threads_t){&c, &rfdevice, antennas, c.dft, samplesRx, samplesTx};
+  threads_t params = (threads_t){&c, &rfdevice, c.nb_ant, c.dft, samplesRx, samplesTx};
   pthread_mutexattr_t attr;
   pthread_mutexattr_init(&attr);
   pthread_mutexattr_settype(&attr, PTHREAD_MUTEX_ERRORCHECK);
@@ -642,10 +641,10 @@ int main(int argc, char **argv) {
 
   pthread_t w_thread;
   if (c.tx)
-    threadCreate(&w_thread, write_thread, &params, "write_thr", 3, OAI_PRIORITY_RT);
+    threadCreate(&w_thread, write_thread, &params, "calibration_write_thr", 3, OAI_PRIORITY_RT);
   pthread_t r_thread;
   if (c.rx)
-    threadCreate(&r_thread, read_thread, &params, "read_thr", 2, OAI_PRIORITY_RT);
+    threadCreate(&r_thread, read_thread, &params, "calibration_read_thr", 2, OAI_PRIORITY_RT);
   if (c.tx) 
     (void)pthread_join(w_thread, NULL);
   if (c.rx)

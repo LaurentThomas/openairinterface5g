@@ -3,13 +3,15 @@
 #include "radio/COMMON/common_lib.h"
 enum e_pattern_scheme { e_SINUS, e_CHIRP, e_QPSK, e_QAM_16, e_QAM_64, e_QAM_256, e_RAMP, e_SIGNATURE, e_MAX_PATT_SCHEME };
 
+#define MAX_OCANT 2
 typedef struct {
   uint tx;
   uint rx;
+  uint nb_ant;
   uint freq;
-  enum e_pattern_scheme tx_pattern;
-  uint amplitude;
-  uint sinus_freq;
+  enum e_pattern_scheme tx_pattern[MAX_OCANT];
+  uint amplitude[MAX_OCANT];
+  uint sinus_freq[MAX_OCANT];
   uint dft;
   char * file;
   char * dump_iq;
