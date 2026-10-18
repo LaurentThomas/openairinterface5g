@@ -215,6 +215,11 @@ add_physim_test(physim.5g.nr_pucchsim.test54 "Format 3 3-bit number of symbols =
 add_physim_test(physim.5g.nr_pucchsim.test55 "Format 3 3-bit number of symbols = 4, starting symbol = 4, 1/106 PRB, 4RX" nr_pucchsim -R 106 -z4 -i 4 -P 3 -q1 -b 3 -B 3 -I 4 -s-7 -n3000 -C)
 add_physim_test(physim.5g.nr_pucchsim.test56 "Format 3 3-bit number of symbols = 4, starting symbol = 8, 1/106 PRB, 4RX" nr_pucchsim -R 106 -z4 -i 4 -P 3 -q1 -b 3 -B 3 -I 8 -s-7 -n3000 -C)
 add_physim_test(physim.5g.nr_pucchsim.test57 "Format 3 7-bit number of symbols = 14, no frequency hopping, 1/106 PRB, 4RX" nr_pucchsim -R 106 -z4 -i 14 -P 3 -q1 -b 7 -B 3 -e -s-11 -n3000 -C)
+add_physim_test(physim.5g.nr_pucchsim.test58 "Format 3 12-bit number of symbols = 12, 1/106 PRB, 4RX" nr_pucchsim -R 106 -z4 -i 12 -P 3 -q1 -b 12 -s-8 -n3000)
+add_physim_test(physim.5g.nr_pucchsim.test59 "Format 3 19-bit number of symbols = 12, 1/106 PRB, 4RX" nr_pucchsim -R 106 -z4 -i 12 -P 3 -q1 -b 19 -s-7 -n3000)
+add_physim_test(physim.5g.nr_pucchsim.test60 "Format 3 32-bit number of symbols = 8, 1/106 PRB, 4RX" nr_pucchsim -R 106 -z4 -i 8 -P 3 -q1 -b 32 -s-3 -n3000)
+add_physim_test(physim.5g.nr_pucchsim.test61 "Format 3 12-bit number of symbols = 12, no frequency hopping, 1/106 PRB, 4RX" nr_pucchsim -R 106 -z4 -i 12 -P 3 -q1 -b 12 -e -s-9 -n3000)
+add_physim_test(physim.5g.nr_pucchsim.test62 "Format 3 12-bit number of symbols = 4, 1/106 PRB, 4RX" nr_pucchsim -R 106 -z4 -i 4 -P 3 -q1 -b 12 -s-4 -n3000)
 
 # Two-symbol format 0 without and with frequency hopping; a nonzero hopping ID gives a nonzero sequence group u[0].
 add_physim_test(physim.5g.nr_pucchsim.test49 "Format 0 2-symbol non-hopping ACK and SR"

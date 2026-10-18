@@ -878,7 +878,16 @@ void nr_generate_pucch3_4(c16_t **txdataF,
                                           is_pi_over_2_bpsk_enabled,
                                           add_dmrs);
 
-  nr_uci_encoding(pucch_pdu->payload, pucch_pdu->n_bit, nrofPRB, M_bit, 0, b);
+  if (pucch_pdu->n_bit < 12) {
+    nr_uci_encoding(pucch_pdu->payload, pucch_pdu->n_bit, nrofPRB, M_bit, 0, b);
+  } else {
+    // Polar rate matching to M_bit (TS 38.212 Table 6.3.1.4-1). The PUCCH message type assumes the
+    // format 2 length 16 * nrofPRB, so pass E directly like UCI on PUSCH; the API carries it in 8 bits.
+    AssertFatal(M_bit <= 255, "PUCCH format 3/4 polar encoding with M_bit = %d > 255 bits is not supported\n", M_bit);
+    memset(b, 0, sizeof(b));
+    uint64_t payload = reverse_bits(pucch_pdu->payload, pucch_pdu->n_bit);
+    polar_encoder_fast(&payload, b, 0, 0, NR_POLAR_UCI_PUSCH_MESSAGE_TYPE, pucch_pdu->n_bit, M_bit);
+  }
   /*
    * Implementing TS 38.211
    * Subclauses 6.3.2.6.1 Scrambling (PUCCH formats 3 and 4)

@@ -1549,36 +1549,9 @@ void nr_decode_pucch2(PHY_VARS_gNB *gNB,
   }
 }
 
-/* ===== PUCCH format 3 reception (from pucch3_L1); format 2 handled by nr_decode_pucch2 above =====
+/* ===== PUCCH format 3 reception; format 2 handled by nr_decode_pucch2 above =====
  * The small-block codeword LUT is identical to format 2's (pucch2_lut, filled by
- * init_pucch2_luts), so format 3 reuses it. Only the polar helper LUTs are format-3 specific. */
-static cw4bit_t pucch3_polar_4bit[16] __attribute__((aligned(32)));
-static simde__m128i pucch3_polar_llr_num_lut[256];
-
-void init_pucch3_luts()
-{
-  for (int i = 0; i < 16; i++) {
-    int16_t *lut_i = pucch3_polar_4bit[i].cw;
-    *lut_i++ = (i & 0x1) <= 0;
-    *lut_i++ = (i & 0x2) <= 0;
-    *lut_i++ = (i & 0x4) <= 0;
-    *lut_i++ = (i & 0x8) <= 0;
-  }
-  for (int cw = 0; cw < 256; cw++) {
-    int16_t *lut_num_i = (int16_t *)&pucch3_polar_llr_num_lut[cw];
-    *lut_num_i++ = (cw & 0x1) <= 0;
-    *lut_num_i++ = (cw & 0x10) <= 0;
-    *lut_num_i++ = (cw & 0x2) <= 0;
-    *lut_num_i++ = (cw & 0x20) <= 0;
-    *lut_num_i++ = (cw & 0x4) <= 0;
-    *lut_num_i++ = (cw & 0x40) <= 0;
-    *lut_num_i++ = (cw & 0x8) <= 0;
-    *lut_num_i++ = (cw & 0x80) <= 0;
-#ifdef DEBUG_NR_PUCCH_RX
-    // log_dump(PHY, pucch2_polar_llr_num_lut, 8, LOG_DUMP_C16, "lut_num %d:", i);
-#endif
-  }
-}
+ * init_pucch2_luts), so format 3 reuses it. */
 
 static const int dmrs0[11] = {0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3};
 static const int dmrs1[11] = {2, 3, 4, 4, 5, 6, 7, 7, 8, 9, 10};
@@ -1718,81 +1691,83 @@ static uint64_t nr_pucch3_ml_shortblock(const nfapi_nr_pucch_pdu_t *pucch_pdu,
   return (uint64_t)cw_ML;
 }
 
-// Polar-coded (>= 12 bit) decode for PUCCH format 2/3: build non-coherent LLRs on half-PRB
-// groups, run the polar decoder and return its decoder state; decodedPayload receives the bits.
+// Polar-coded (>= 12 bit) decode for PUCCH format 3: coherent QPSK LLRs on the data symbols,
+// with the DMRS of each hop as channel reference, then polar decoding of the E rate-matched bits
+// (TS 38.212 Table 6.3.1.4-1). Returns the decoder state; decodedPayload receives the bits.
 static int nr_pucch3_decode_polar(const nfapi_nr_pucch_pdu_t *pucch_pdu,
                                   int Prx,
                                   int nb_symbols,
                                   int ndmrs,
                                   int ngroup,
-                                  int nc_group_size,
                                   int nb_bit,
+                                  const int dmrspos[4],
                                   int nb_re_data_padded,
                                   c16_t r_ext[Prx][nb_symbols - ndmrs][nb_re_data_padded],
                                   c16_t r_ext2[Prx][nb_symbols - ndmrs][nb_re_data_padded],
                                   c32_t corr32[nb_symbols][ngroup][Prx],
                                   uint64_t *decodedPayload)
 {
-  int decoderState;
-  uint8_t corr_dB;
-  simde__m128i llrs[pucch_pdu->prb_size * 2 * nb_symbols];
-  // non-coherent LLR computation on groups of 4 REs (half-PRBs)
-  uint64_t corr = 0;
-  const simde__m128i ones = simde_mm_set1_epi16(1);
-  for (int symb = 0; symb < nb_symbols; symb++) {
-    for (int half_prb = 0; half_prb < (2 * pucch_pdu->prb_size); half_prb++) {
-      int group = (6 * half_prb) / (12 * nc_group_size);
-      simde__m128i llr_num = simde_mm_set1_epi16(0);
-      simde__m128i llr_den = simde_mm_set1_epi16(0);
-      for (int cw = 0; cw < 256; cw++) {
-        int64_t corr_tmp = 0;
-        for (int aa = 0; aa < Prx; aa++) {
-          simde__m128i part1 = simde_mm_set_epi64x(0ULL, *(int64_t *)&pucch3_polar_4bit[cw & 15].cw);
-          simde__m128i part2 = simde_mm_set_epi64x(0ULL, *(int64_t *)&pucch3_polar_4bit[cw >> 4].cw);
-          simde__m128i factor = simde_mm_unpacklo_epi16(part1, part2);
-          simde__m128i re = *(simde__m128i *)&r_ext[aa][symb][half_prb * 4];
-          simde__m128i im = *(simde__m128i *)&r_ext2[aa][symb][half_prb * 4];
-          simde__m128i prod_re = simde_mm_madd_epi16(re, factor);
-          simde__m128i prod_im = simde_mm_madd_epi16(im, factor);
-          prod_re = simde_mm_hadd_epi32(prod_re, prod_re);
-          prod_im = simde_mm_hadd_epi32(prod_im, prod_im);
-          prod_re = simde_mm_hadd_epi32(prod_re, prod_re);
-          prod_im = simde_mm_hadd_epi32(prod_im, prod_im);
-          simde__m128i prod = simde_mm_srai_epi32(simde_mm_unpacklo_epi32(prod_re, prod_im), 5);
-          c64_t corr64 = (c64_t){corr32[symb][group][aa].r / (2 * nc_group_size * 4 / 2),
-                                 corr32[symb][group][aa].i / (2 * nc_group_size * 4 / 2)};
-          //  _mm_srai_epi64 is missing in SIMDE package, we need to update it
-          c64_t prod2 = {simde_mm_extract_epi32(prod, 0), simde_mm_extract_epi32(prod, 1)};
-          csum(prod2, prod2, corr64);
-          corr_tmp += squaredMod(prod2) >> (Prx / 2);
-          // this is for UL CQI measurement
-          if (cw == 0)
-            corr += squaredMod(corr32[symb][group][aa]);
-        }
-        simde__m128i corr16 = simde_mm_set1_epi16((int16_t)(corr_tmp >> 8));
-        simde__m128i den = simde_mm_xor_si128(pucch3_polar_llr_num_lut[cw], ones);
-        llr_num = simde_mm_max_epi16(simde_mm_mullo_epi16(corr16, pucch3_polar_llr_num_lut[cw]), llr_num);
-        llr_den = simde_mm_max_epi16(simde_mm_mullo_epi16(corr16, den), llr_den);
-      }
-      // compute llrs
-      llrs[half_prb + symb * 2 * pucch_pdu->prb_size] = simde_mm_subs_epi16(llr_num, llr_den);
-      LOG_DDUMP(PHY, llrs + half_prb + symb * 2 * pucch_pdu->prb_size, 8, LOG_DUMP_I16, "llrs:");
-    } // half_prb
-  } // symb
+  AssertFatal(ngroup == 1, "PUCCH 3 is decoded as a single group spanning the whole allocation\n");
+  AssertFatal(!pucch_pdu->pi_2bpsk, "PUCCH 3 polar decoding with pi/2-BPSK is not supported\n");
+  const bool freq_hop = pucch_pdu->freq_hop_flag;
+  const int nb_re_data = 12 * pucch_pdu->prb_size;
+  const int E = 2 * nb_re_data * (nb_symbols - ndmrs); // QPSK on every data RE
+  // The polar API carries E in 8 bits (aggregation_level); larger allocations need it widened.
+  AssertFatal(E <= 255, "PUCCH 3 polar decoding with E = %d > 255 bits is not supported\n", E);
 
-  // run polar decoder on llrs
-  decoderState =
-      polar_decoder_int16((int16_t *)llrs, decodedPayload, 0, NR_POLAR_UCI_PUCCH_MESSAGE_TYPE, nb_bit, pucch_pdu->prb_size);
+  // Channel reference per hop and antenna: sum of the DMRS correlations y * conj(r) of that hop
+  c64_t h[2][Prx];
+  memset(h, 0, sizeof(h));
+  for (int d = 0; d < ndmrs; d++) {
+    const int set = (freq_hop && dmrspos[d] >= nb_symbols / 2) ? 1 : 0;
+    for (int aa = 0; aa < Prx; aa++) {
+      csum(h[set][aa], h[set][aa], corr32[dmrspos[d]][0][aa]);
+    }
+  }
+
+  // Re(conj(h) * conj(x) * y) per bit. r_ext holds the unscrambled [Re Im] of y and r_ext2 the
+  // unscrambled [Im -Re], so LLR(b0) = h.r * r_ext.r + h.i * r_ext2.r and
+  // LLR(b1) = h.r * r_ext.i + h.i * r_ext2.i (positive for bit 0).
+  int64_t llr64[E];
+  uint64_t maxabs = 1;
+  int s3 = 0;
+  for (int symb = 0; symb < nb_symbols; symb++) {
+    if (is_pucch3_dmrs_symbol(symb, dmrspos))
+      continue;
+    const int set = (freq_hop && symb >= nb_symbols / 2) ? 1 : 0;
+    for (int k = 0; k < nb_re_data; k++) {
+      int64_t b0 = 0, b1 = 0;
+      for (int aa = 0; aa < Prx; aa++) {
+        const c64_t ch = h[set][aa];
+        const c16_t y = r_ext[aa][s3][k];
+        const c16_t y2 = r_ext2[aa][s3][k];
+        b0 += ch.r * y.r + ch.i * y2.r;
+        b1 += ch.r * y.i + ch.i * y2.i;
+      }
+      llr64[2 * (s3 * nb_re_data + k)] = b0;
+      llr64[2 * (s3 * nb_re_data + k) + 1] = b1;
+      maxabs = max(maxabs, (uint64_t)llabs(b0));
+      maxabs = max(maxabs, (uint64_t)llabs(b1));
+    }
+    s3++;
+  }
+
+  // scale to 8 bits: with larger LLRs the int16 list decoder saturates its path metrics at high SNR
+  // and picks a wrong candidate for some payloads
+  int shift = 0;
+  while ((maxabs >> shift) > 255)
+    shift++;
+  int16_t llrs[E];
+  for (int i = 0; i < E; i++)
+    llrs[i] = llr64[i] >> shift;
+  LOG_DDUMP(PHY, llrs, E, LOG_DUMP_I16, "PUCCH 3 llrs:");
+
+  // NR_POLAR_UCI_PUSCH_MESSAGE_TYPE takes E directly; the PUCCH type assumes the format 2 length
+  int decoderState = polar_decoder_int16(llrs, decodedPayload, 0, NR_POLAR_UCI_PUSCH_MESSAGE_TYPE, nb_bit, E);
 
   // Decoder reversal
   decodedPayload[0] = reverse_bits(decodedPayload[0], nb_bit);
-
-  if (decoderState > 0)
-    decoderState = 1;
-  corr_dB = dB_fixed64(corr);
-  LOG_D(PHY, "metric %d dB\n", corr_dB);
-  (void)corr_dB;
-  return decoderState;
+  return decoderState > 0 ? 1 : decoderState;
 }
 
 void nr_decode_pucch3(PHY_VARS_gNB *gNB,
@@ -2047,8 +2022,8 @@ void nr_decode_pucch3(PHY_VARS_gNB *gNB,
                                           nb_symbols,
                                           ndmrs,
                                           ngroup,
-                                          nc_group_size,
                                           nb_bit,
+                                          dmrspos,
                                           nb_re_data_padded,
                                           r_ext,
                                           r_ext2,

@@ -498,29 +498,31 @@ halving the number of correlations. Format 3 reuses Format 2's small-block
 codeword LUT `pucch2_lut` (identical contents), initialised by
 `init_pucch2_luts()`.
 
-### 4.7 Decoding — Polar Code (12–64 bits)
+### 4.7 Decoding — Polar Code (12–64 bits), Format 3
 
-**LLR computation** (per 4-RE group):
+**Channel reference:** per hop $s$ and antenna, the sum of the DMRS correlations
+$h_{s,aa} = \sum_{d \in s} \text{corr32}[d]$ (one set without hopping).
 
-For each group of 4 data REs and all 256 possible 8-bit partial codewords,
-a correlation is computed between the received vector and the coded pattern.
-LLR numerator and denominator for each bit $b$ are:
+**Coherent QPSK LLRs** on the data symbols only (DMRS symbols are skipped).
+`r_ext` holds the unscrambled $[\Re y, \Im y]$ and `r_ext2` the unscrambled
+$[\Im y, -\Re y]$, so $\Re(h^* x^* y)$ splits per bit:
 
-$$\lambda_b^+ = \max_{\mathbf{c}:\,c_b=1} \rho(\mathbf{c}), \qquad
-  \lambda_b^- = \max_{\mathbf{c}:\,c_b=0} \rho(\mathbf{c})$$
+$$\text{LLR}[2k] = \sum_{aa} h_r\, r_{ext}[k].r + h_i\, r_{ext2}[k].r, \qquad
+  \text{LLR}[2k+1] = \sum_{aa} h_r\, r_{ext}[k].i + h_i\, r_{ext2}[k].i$$
 
-$$\text{LLR}[b] = \lambda_b^+ - \lambda_b^-$$
+(positive for bit 0), in rate-matching order, then scaled to 8 bits (with larger
+LLRs the int16 list decoder saturates its path metrics at high SNR).
 
-where $\rho(\mathbf{c})$ is the per-group correlation energy. LUT tables
-(`pucch3_polar_llr_num_lut`) pre-encode the bit-to-pattern mapping as SIMD
-registers, enabling vectorised accumulation.
-
-**Polar decoding:**
+**Polar decoding** over $E = 24 \cdot N_{PRB} \cdot (N_{symb} - N_{DMRS})$ bits
+(TS 38.212 Table 6.3.1.4-1, QPSK):
 
 ```c
-polar_decoder_int16(llrs, decodedPayload, NR_POLAR_UCI_PUCCH_MESSAGE_TYPE, ...)
+polar_decoder_int16(llrs, decodedPayload, 0, NR_POLAR_UCI_PUSCH_MESSAGE_TYPE, nb_bit, E)
 ```
 
+The PUSCH message type takes $E$ directly (the PUCCH type assumes the format 2
+length $16 \cdot N_{PRB}$). The polar API carries $E$ in 8 bits, so $E > 255$
+and pi/2-BPSK are rejected with an assertion. The UE encoder uses the same $E$.
 The decoded bit vector is bit-reversed to match the TS 38.212 interleaving
 convention.
 
@@ -547,18 +549,6 @@ calls `nr_cyclic_shift_hopping()`, converts to an integer index (dividing by
 $\pi/6$), and stores in a flat LUT.  Returns the cache slot index for use by
 `nr_decode_pucch0`.
 
-### `init_pucch3_luts()`
-
-Called once at gNB startup. Populates only the format-3 **polar** helper LUTs:
-
-- `pucch3_polar_4bit[16]` and `pucch3_polar_llr_num_lut[256]` — 4-/8-bit
-  partial-codeword patterns packed into SIMD registers for the polar LLR
-  computation.
-
-The small-block codeword LUT is **not** duplicated here: format 3 reuses format
-2's `pucch2_lut` (filled by `init_pucch2_luts()`), since the QPSK-mapped
-Reed-Muller codewords are identical for both formats.
-
 ### `nr_fill_pucch()` (lines 33–55)
 
 Finds a free slot in `gNB->pucch[]`, copies the incoming
@@ -582,8 +572,9 @@ Short-block (3–11 bit) maximum-likelihood decode for Formats 2 and 3
 
 ### `nr_pucch3_decode_polar()` (lines 1385–1458)
 
-Polar-coded (12–64 bit) decode for Formats 2 and 3 (Section 4.7).  Computes
-non-coherent LLRs, runs the polar decoder, and returns its decoder state.
+Polar-coded (12–64 bit) decode for Format 3 (Section 4.7).  Computes coherent
+LLRs on the data symbols against the per-hop DMRS reference, runs the polar
+decoder over E bits, and returns its decoder state.
 
 ---
 
